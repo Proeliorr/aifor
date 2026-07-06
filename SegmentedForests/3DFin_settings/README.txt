@@ -1,0 +1,1 @@
+3DFin parameters used to compute quantitative descriptors of each plot as described in SegmentedForests: a labelled dataset of terrestrial LiDAR point clouds for semantic segmentation of forests > Point cloud acquisition and processing > Point cloud processing.

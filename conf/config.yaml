@@ -1,0 +1,77 @@
+# Single config for the whole pipeline. Each top-level section configures one stage;
+# each entry script reads only its own section. Override on the CLI with the section
+# prefix, e.g. `threedfin.plots=[plot_01]` or `threedfin.dry_run=true`.
+
+# ============================================================================
+# Stage 1 — 3DFin instance segmentation
+#   run with: python main_pipeline.py   (engine: pipeline/threedfin.py)
+# ============================================================================
+threedfin:
+  # --- Input / output folders (edit these) ---
+  pointclouds_dir: D:\Podyplomowe\04_AI_Intro\assignment\SegmentedForests\pointclouds
+  ini_dir:         D:\Podyplomowe\04_AI_Intro\assignment\SegmentedForests\3DFin_settings
+  output_dir:      D:\Podyplomowe\04_AI_Intro\assignment\SegmentedForests\3DFin_output
+
+  # --- 3DFin binary (aifor env) ---
+  threedfin_bin: C:/ProgramData/miniforge3/envs/aifor/Scripts/3DFin.exe
+
+  # --- 3DFin CLI flags ---
+  # null = derive from each plot's .ini [misc] (recommended); true/false = force for all plots.
+  # Note 3DFin maps `is_normalized = not --normalize`: the dataset clouds are NOT height-
+  # normalized (is_normalized=False), so deriving from the .ini passes --normalize.
+  normalize: null
+  denoise: null
+  export_txt: null
+
+  # --- Run control ---
+  pattern: "*.laz"
+  plots: null               # null = all plots; or a list like [plot_01, plot_05]
+  prune_outputs: true       # keep only <plot>_tree_ID_dist_axes.las + 3dfin_log.txt per plot; false = keep all 3DFin files
+  dry_run: false
+  continue_on_error: true
+
+# ============================================================================
+# Stage 2 — prepare plots for ForAINet (center coordinates + PLY) / restore results
+#   run with: python forainet_prep.py   (engine: pipeline/forainet_prep.py)
+# ============================================================================
+forainet_prep:
+  # --- Mode ---
+  # preprocess = input clouds -> centered ForAINet PLYs + per-plot <plot>_offsets.yml
+  #              (the yml also records source format, LAS version/point format/scales
+  #              and the CRS as WKT, so restoration is faithful)
+  # restore    = classified PLYs -> original coordinates (shifts added back)
+  mode: preprocess
+
+  # --- preprocess mode: input / output (edit these) ---
+  # Input clouds may be .las (1.2-1.4), .laz or .ply — the processing is identical.
+  # `patterns` are matched directly in input_dir (flat layout) AND one level down in
+  # per-plot subfolders (the 3DFin output tree). Narrow to ["*_tree_ID_dist_axes.las"]
+  # when plot folders hold more than one matching cloud (e.g. prune_outputs=false).
+  input_dir:  D:\Podyplomowe\04_AI_Intro\assignment\SegmentedForests\3DFin_output
+  patterns: ["*.las", "*.laz", "*.ply"]
+  # Folder receiving <plot>.ply + <plot>_offsets.yml (created if missing).
+  output_dir: D:\Podyplomowe\04_AI_Intro\assignment\SegmentedForests\ForAINet_input
+
+  # --- preprocess mode: source field names ---
+  # Which source fields hold the ground-truth semantic label, the tree/instance id
+  # and the intensity. null = auto-detect (semantic: Class/semantic_seg/classification;
+  # tree id: tree_ID/treeID; intensity: intensity/scalar_Intensity/...). Set explicitly
+  # for data with differently named ground-truth fields — a configured name missing
+  # from a file fails that plot loudly instead of silently writing zeros.
+  semantic_field: null
+  tree_id_field: null
+  intensity_field: null
+
+  # --- restore mode ---
+  restore_dir: null         # folder of classified *.ply to restore (required for mode=restore)
+  offsets_dir: null         # where the <plot>_offsets.yml live; null = output_dir
+  # laz (default) = compressed LAS 1.4 with the source scales + CRS re-applied and all
+  # extra fields (labels, predictions) kept as extra-bytes dimensions; las = same,
+  # uncompressed; ply = plain PLY.
+  restore_format: laz
+
+  # --- Run control ---
+  plots: null               # null = all plots; or a list like [plot_01, plot_05]
+  overwrite: true           # false = skip plots whose output file already exists
+  dry_run: false
+  continue_on_error: true

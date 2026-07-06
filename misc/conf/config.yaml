@@ -1,0 +1,26 @@
+# Config for the standalone tree splitter (misc/tree_splitter.py). The keys live under
+# a `tree_splitter:` section — the same override prefix as when it was a pipeline stage,
+# e.g. `tree_splitter.plots=[plot_01]` or `tree_splitter.dry_run=true`.
+
+# ============================================================================
+# Tree splitter — split plots into per-tree numpy files
+#   run with: python misc/tree_splitter.py   (from the assignment/ folder)
+# ============================================================================
+tree_splitter:
+  # --- Input (edit this) ---
+  # Root folder holding one subfolder per plot; each must contain the file matching `pattern`.
+  input_dir: D:\Podyplomowe\04_AI_Intro\assignment\SegmentedForests\3DFin_output
+  pattern: "*_tree_ID_dist_axes.las"
+
+  # --- Array content ---
+  # Columns stored in each per-tree array: any LAS dimension, plus the special names
+  # tree_ID (original label) and 2tree_ID (the new ordinal 1..K). Unknown names are skipped.
+  # `Class` is the ground-truth semantic label used to train the downstream model.
+  columns: [x, y, z, Class]
+
+  # --- Run control ---
+  plots: null               # null = all plots; or a list like [plot_01, plot_05]
+  digits: 3                 # zero-padding of the file suffix (3 -> plot_01_001.npy)
+  overwrite: true           # false = skip plots whose <plot>_001.npy already exists
+  dry_run: false
+  continue_on_error: true

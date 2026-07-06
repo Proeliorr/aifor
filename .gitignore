@@ -15,8 +15,6 @@ SegmentedForests/ForAINet_input/*.ply
 # Per-run Hydra logs
 outputs/
 
-# External ForAINet clone (own .git; add as a submodule instead if needed)
-ForAINet/
 
 # Python / Jupyter cruft
 __pycache__/

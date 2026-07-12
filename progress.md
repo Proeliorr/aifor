@@ -82,12 +82,58 @@ Dates follow the Hydra run logs in `outputs/<date>/<time>/`.
   metadata files trackable.
 - `requirements.txt` extended with `lazrs` (LAZ backend), `plyfile`, `PyYAML`.
 
+## 2026-07-13 — Split point-cloud viewer (diagnostic tool, `misc/`)
+
+- **`misc/view_split_point_cloud.ipynb`**: tkinter GUI (launched from a notebook cell)
+  comparing **two point clouds side by side** — five spatial views each (XY top,
+  XZ front, YZ side, ISO 45°, ISO 135°), per-field statistics (dtype/min/max/unique),
+  colouring by any field (≤ 20 unique ints → discrete legend, else viridis colourbar),
+  and per-cloud filtering by **value set** (`Class in {2,3}`) or **min/max range**.
+  Built to diagnose which fields/labels should be merged — groundwork for the planned
+  `class_map` reclassifier.
+- Reads `.las`/`.laz`/`.ply`/`.npy`; bare `.npy` matrices get column names from a
+  **JSON sidecar** with the same stem (`plot_01_007.json`, `{"columns": [...]}` +
+  optional metadata keys shown in the info box; missing/mismatched sidecar → fallback
+  names `x, y, z, col_3…` with a visible warning). Sidecars will be produced by a
+  separate export script (later stage).
+- Random downsample after filtering (default 100k points, fixed seed) keeps
+  multi-million-point plots responsive; matplotlib toolbar gives zoom/pan/save-PNG.
+- `matplotlib` added to the `aifor` env (pip user-install; conda cache in
+  `C:\ProgramData` not writable). Verified: 27 headless loader/filter/projection
+  tests + GUI smoke test against plot_01 (18M points, 119 tree IDs).
+
+## 2026-07-13 — Class unifier stage (`class_unifier`)
+
+- **`class_unifier.py` + `pipeline/class_unifier.py`**: new stage in the standard
+  hydra-zen pattern (`class_unifier:` section in `conf/config.yaml`). For every input
+  cloud (`.las`/`.laz`/`.ply`, flat or one level down — same collection as Stage 2):
+  finds the semantic-label column (`semantic_field`, `null` = auto-detect), creates a
+  **new column** (`unified_field`, default `semantic_seg`) with the labels sent through
+  **`class_map: {source: unified}`** — several sources sharing one target **merges**
+  classes (`{1: 2, 4: 2}` folds 1 and 4 into 2); `unmapped_value` controls values
+  absent from the map (keep-with-warning or force). Default map = identity ({0..4}),
+  default `class_names` = ForAINet's five classes.
+- Exports `<plot>.npy` (plain `N×7` float64: `x, y, z, intensity, <source label>,
+  <unified label>, <tree id>`) + **`<plot>.json` sidecar** (same stem): `columns` +
+  `dtypes` (numpy-restorable names), source file/format, the map used, per-class
+  point counts before/after — directly loadable by `misc/view_split_point_cloud.ipynb`.
+- Reuses Stage 2 plumbing (`_read_cloud`, `_collect_inputs`, `_plot_name`) — no
+  duplicated readers.
+- Hydra gotcha found while testing: CLI dict overrides **merge** with the config map
+  (`class_unifier.class_map={1: 2}` keeps the other keys); full replacement needs the
+  keys spelled out.
+- Verified: identity run on plot_01 (20,831,953 pts, counts unchanged
+  {0: 1647848, 1: 4770862, 2: 8430699, 3: 5974506, 4: 8038}); merge run
+  1,2→2 gives 13,201,561; synthetic PLY covers both `unmapped_value` branches;
+  viewer loads the npy+json with names restored and zero warnings.
+
 ---
 
 ## Planned
 
-- **Semantic-label reclassification**: merging classes and assigning new class numbers
-  via a `class_map: {old: new}` config key, plugging into the `_semantic_labels()`
-  hook in `pipeline/forainet_prep.py` (the designated place — already isolated).
+- **In-PLY reclassification (optional)**: the `_semantic_labels()` hook in
+  `pipeline/forainet_prep.py` is still a straight copy; if remapped labels should be
+  written directly into the Stage 2 PLYs (instead of / in addition to the standalone
+  `class_unifier` stage), a `class_map` key can plug in there the same way.
 - Optional: `pyproj` in the env would let `crs_wkt` capture also GeoTIFF-key CRSs
   (LAS 1.2/1.3 style); WKT-based CRSs (mandatory in LAS 1.4) already work without it.

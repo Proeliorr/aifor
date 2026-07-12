@@ -17,10 +17,16 @@ scope; tools for that live in `misc/`).
   (shifts + source metadata: format, LAS version/point format/scales, CRS WKT);
   `mode=restore` brings classified PLYs back to original coordinates as LAZ 1.4
   (scales + CRS re-applied, all fields kept as extra-bytes dims).
+- **Class unifier** `class_unifier.py` → `pipeline/class_unifier.py`: remaps the
+  semantic-label column through `class_map: {source: unified}` (many-to-one entries
+  merge classes) into a new column (`unified_field`), exports `<plot>.npy` (N×7
+  float64) + `<plot>.json` sidecar (`columns`/`dtypes` + provenance) — readable by
+  `misc/view_split_point_cloud.ipynb`. Reuses Stage 2's `_read_cloud`/`_collect_inputs`.
+  Hydra gotcha: CLI dict overrides *merge* into the config map, they don't replace it.
 
 Config pattern: one shared `conf/config.yaml`, one section per stage
-(`threedfin:`, `forainet_prep:`), one hydra-zen entry script per stage.
-Override keys with the section prefix: `forainet_prep.plots=[plot_02]`.
+(`threedfin:`, `class_unifier:`, `forainet_prep:`), one hydra-zen entry script per
+stage. Override keys with the section prefix: `forainet_prep.plots=[plot_02]`.
 
 ## Environment / running
 
@@ -48,9 +54,10 @@ on other machines.
   `continue_on_error`, `=`-rule summary log line.
 - laspy gotcha: materialise accessors with `np.asarray(...)` (ScaledArrayView /
   SubFieldView are not plain arrays).
-- Planned work is listed at the bottom of `progress.md`. The next known item:
-  `class_map` label reclassification — plug into `_semantic_labels()` in
-  `pipeline/forainet_prep.py` (isolated there on purpose).
+- Planned work is listed at the bottom of `progress.md`. Label reclassification ships
+  as the standalone `class_unifier` stage; the `_semantic_labels()` hook in
+  `pipeline/forainet_prep.py` remains a straight copy (plug a `class_map` in there
+  only if remapped labels should go directly into the Stage 2 PLYs).
 
 ## Adjacent (not part of the pipeline)
 

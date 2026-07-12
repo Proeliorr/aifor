@@ -31,6 +31,62 @@ threedfin:
   continue_on_error: true
 
 # ============================================================================
+# Class unifier — remap semantic labels into a new column, export .npy + .json
+#   run with: python class_unifier.py   (engine: pipeline/class_unifier.py)
+# ============================================================================
+class_unifier:
+  # --- Input / output (edit these) ---
+  # Inputs may be .las (1.2-1.4), .laz or .ply; `patterns` are matched directly in
+  # input_dir (flat layout) AND one level down in per-plot subfolders (the 3DFin
+  # output tree). Default input = Stage 1 results.
+  input_dir:  D:\Podyplomowe\04_AI_Intro\assignment\SegmentedForests\3DFin_output
+  patterns: ["*.las", "*.laz", "*.ply"]
+  # Folder receiving <plot>.npy + <plot>.json (created if missing).
+  output_dir: D:\Podyplomowe\04_AI_Intro\assignment\SegmentedForests\ClassUnifier_output
+
+  # --- Source field names ---
+  # Which source columns hold the semantic label, tree/instance id and intensity.
+  # null = auto-detect (semantic: Class/semantic_seg/classification; tree id:
+  # tree_ID/treeID; intensity: intensity/scalar_Intensity/...). Set explicitly for
+  # data whose ground truth lives under a different name — a configured name missing
+  # from a file fails that plot loudly instead of silently writing zeros.
+  semantic_field: null
+  tree_id_field: null
+  intensity_field: null
+
+  # --- The unification ---
+  # Name of the NEW column receiving the remapped labels (the source column is kept
+  # unchanged next to it).
+  unified_field: semantic_seg
+  # {source: unified} value mapping. MERGES are expressed by giving several sources
+  # the same target, e.g. {1: 2, 4: 2} folds classes 1 and 4 into class 2.
+  # Identity by default — edit when the real correspondence is known. CLI override:
+  #   "class_unifier.class_map={0: 0, 1: 2, 2: 2, 3: 3, 4: 2}"
+  class_map:
+    0: 0
+    1: 1
+    2: 2
+    3: 3
+    4: 4
+  # Source values absent from class_map: null = keep as-is (with a warning listing
+  # them); an integer = force that value (e.g. 0 = "unclassified").
+  unmapped_value: null
+  # {value: name} documentation of the unified scheme, echoed into each sidecar.
+  # Defaults to ForAINet's five classes (see ForAINet's treeins_set1 datasets).
+  class_names:
+    0: low_vegetation
+    1: ground
+    2: stem_points
+    3: live_branches
+    4: branches
+
+  # --- Run control ---
+  plots: null               # null = all plots; or a list like [plot_01, plot_05]
+  overwrite: true           # false = skip plots whose <plot>.npy already exists
+  dry_run: false
+  continue_on_error: true
+
+# ============================================================================
 # Stage 2 — prepare plots for ForAINet (center coordinates + PLY) / restore results
 #   run with: python forainet_prep.py   (engine: pipeline/forainet_prep.py)
 # ============================================================================

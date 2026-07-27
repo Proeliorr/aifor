@@ -46,21 +46,4 @@ temp_removed/
 # Archived training dataset (~1 GB zip): kept on disk, never in git.
 old_training_dataset/
 
-# ---------------------------------------------------------------------------
-# ForAINet/ is a SUBMODULE -- nothing here applies inside it.
-#
-# A parent .gitignore never governs a submodule's contents; the submodule keeps
-# its own index and ignore rules. (Two further reasons the old
-# `ForAINet\PointCloudSegmentation\...` lines did nothing: .gitignore always
-# uses forward slashes, and a backslash is an escape character, not a
-# separator.) These paths also come from upstream's pinned commit, so ignoring
-# them could not remove them anyway.
-#
-# To stop the submodule reporting its local data as untracked, exclude it from
-# INSIDE the submodule -- local only, leaves upstream's tracked files alone:
-#     ForAINet/.git/info/exclude
-#
-# To avoid having unused upstream subprojects (superpoint_graph/, tree_metrics/)
-# on disk at all, use a sparse checkout rather than an ignore rule:
-#     git -C ForAINet sparse-checkout set PointCloudSegmentation
-# ---------------------------------------------------------------------------
+

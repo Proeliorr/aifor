@@ -55,6 +55,107 @@ index 54b0608..0788b3f 100644
    id:
    public: True # It will be display the model within wandb log, else not.
    config:
+diff --git a/PointCloudSegmentation/torch_points3d/datasets/panoptic/treeins_set1.py b/PointCloudSegmentation/torch_points3d/datasets/panoptic/treeins_set1.py
+index 4fe0472..90358b2 100644
+--- a/PointCloudSegmentation/torch_points3d/datasets/panoptic/treeins_set1.py
++++ b/PointCloudSegmentation/torch_points3d/datasets/panoptic/treeins_set1.py
+@@ -18,12 +18,14 @@ from torch_points3d.models.panoptic.ply import read_ply, write_ply
+ 
+ # @Treeins
+ # -1 means unlabelled semantic classes
++# LOCAL PATCH (SegmentedForests): 5 -> 4 classes; upstream class 4 "branches" has no
++# counterpart in the SegmentedForests labelling. Kept in sync with the same names and
++# colours in datasets/segmentation/treeins_set1.py, which declares them a second time.
+ CLASSES_INV = {
+     0: "low_vegetation",
+     1: "ground",
+     2: "stem_points",
+     3: "live_branches",
+-    4: "branches",
+ }
+ 
+ OBJECT_COLOR = np.asarray(
+@@ -32,13 +34,14 @@ OBJECT_COLOR = np.asarray(
+         [95, 156, 196],  # 'ground' .-> . blue
+         [179, 116, 81],  # 'stem_points'  ->  brown
+         [241, 149, 131],  # 'live_branches'  ->  salmon
+-        [81, 163, 148],  # 'branches'  ->  bluegreen
+         [0, 0, 0],  # unlabelled .->. black
+     ]
+ )
+ 
+-VALID_CLASS_IDS = [0, 1, 2, 3, 4]
+-SemIDforInstance = np.array([2,3,4])  # only class tree/1 is is a semantic class with instances, namely tree instances. In contrast, semantic class non-tree is a stuff class.
++VALID_CLASS_IDS = [0, 1, 2, 3]
++# Semantic classes that carry tree instances. "branches" (4) is gone, so instances now
++# come from stem_points + live_branches only.
++SemIDforInstance = np.array([2,3])  # only class tree/1 is is a semantic class with instances, namely tree instances. In contrast, semantic class non-tree is a stuff class.
+ 
+ 
+ ################################### UTILS #######################################
+@@ -102,20 +105,27 @@ def to_ins_ply(pos, label, file):
+ 
+ # @Treeins: added parameter output_file_name because we now save several final evaluation files because we have several test files
+ def final_eval(pre_sem, pre_ins_offset, pos, gt_sem, gt_ins, output_file_name):
++    # LOCAL PATCH (SegmentedForests): 5 -> 4 semantic classes.
++    # NOTE the counters below are 1-BASED and shifted: 0 = unclassified, so semantic
++    # class i is counted as i+1. Dropping 0-based class 4 ("branches") therefore drops
++    # the 1-based id 5 from the lists.
++    # NUM_CLASSES stays 3: it counts the BINARY scheme (unclassified / stuff / thing)
++    # used further down, after the labels are collapsed at "mapping labels", and is
++    # independent of how many fine-grained classes exist.
+     NUM_CLASSES = 3  #@Treeins: classes unclassified, non-tree and tree
+-    NUM_CLASSES_sem = 6
+-    NUM_CLASSES_count = 5  # @Treeins: 2 classes without unclassified
++    NUM_CLASSES_sem = 5
++    NUM_CLASSES_count = 5  # @Treeins: 2 classes without unclassified  (unused upstream)
+     # class index for instance segmenatation
+     ins_classcount = [2]  # @Treeins
+     # class index for stuff segmentation
+     stuff_classcount = [1]  # @Treeins
+     # class index for semantic segmenatation
+-    sem_classcount = [1, 2, 3, 4, 5]  # @Treeins
+-    sem_classcount_remove_ground = [1, 3, 4, 5]
++    sem_classcount = [1, 2, 3, 4]  # @Treeins
++    sem_classcount_remove_ground = [1, 3, 4]
+     #class index for semantic classes with gt points
+     sem_classcount_have = []
+     stuff_classes = [1,2]
+-    thing_classes = [3,4,5]
++    thing_classes = [3,4]
+ 
+     # log directory
+     # file_path = '/scratch2/torch-points3d/outputs/2021-10-20/06-19-43/eval/2021-10-26_14-27-55/'
+diff --git a/PointCloudSegmentation/torch_points3d/datasets/segmentation/treeins_set1.py b/PointCloudSegmentation/torch_points3d/datasets/segmentation/treeins_set1.py
+index da8e53f..5242246 100644
+--- a/PointCloudSegmentation/torch_points3d/datasets/segmentation/treeins_set1.py
++++ b/PointCloudSegmentation/torch_points3d/datasets/segmentation/treeins_set1.py
+@@ -32,13 +32,15 @@ log = logging.getLogger(__name__)
+ 
+ 
+ #@Treeins: two semantic segmentation classes: non-tree and tree
+-Treeins_NUM_CLASSES = 5
++# LOCAL PATCH (SegmentedForests): 5 -> 4 classes. Upstream class 4 "branches" has no
++# counterpart in the SegmentedForests labelling, so nothing ever maps to it; leaving it
++# declared would train a head for a class that cannot occur. See patches/README.md.
++Treeins_NUM_CLASSES = 4
+ INV_OBJECT_LABEL = {
+     0: "low_vegetation",
+     1: "ground",
+     2: "stem_points",
+     3: "live_branches",
+-    4: "branches",
+ }
+ 
+ OBJECT_COLOR = np.asarray(
+@@ -47,7 +49,6 @@ OBJECT_COLOR = np.asarray(
+         [95, 156, 196],  # 'ground' .-> . blue
+         [179, 116, 81],  # 'stem_points'  ->  brown
+         [241, 149, 131],  # 'live_branches'  ->  salmon
+-        [81, 163, 148],  # 'branches'  ->  bluegreen
+         [0, 0, 0],  # unlabelled .->. black
+     ]
+ )
 diff --git a/PointCloudSegmentation/train.py b/PointCloudSegmentation/train.py
 index c7cbd87..7b972cb 100644
 --- a/PointCloudSegmentation/train.py

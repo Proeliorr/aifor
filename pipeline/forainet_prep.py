@@ -47,6 +47,11 @@ import yaml
 from laspy.vlrs.known import WktCoordinateSystemVlr
 from plyfile import PlyData, PlyElement
 
+# The label remapping rule, shared with the class-unifier stage. It lives in its own
+# module so both stages can import it without a cycle (class_unifier imports the
+# cloud reader from here).
+from pipeline.classes import remap_and_filter
+
 log = logging.getLogger(__name__)
 
 # Suffix stripped from the input file name to recover the plot name
@@ -88,15 +93,29 @@ def _plot_name(path: Path) -> str:
     return stem
 
 
-def _semantic_labels(labels: np.ndarray) -> np.ndarray:
-    """Return the per-point semantic label (``semantic_seg``) as uint8.
+def _semantic_labels(
+    labels: np.ndarray,
+    class_map: Optional[Dict[int, int]],
+    drop_value: Optional[int],
+    plot: str,
+) -> Tuple[np.ndarray, np.ndarray, int]:
+    """Return ``(semantic_seg, keep_mask, n_dropped)`` for one cloud.
 
-    Currently a straight copy of the label array found in the source cloud. This
-    helper is the designated hook for the planned **class reclassification** step:
-    a future ``class_map: {old: new}`` config key will be applied here (merging
-    classes and assigning new class numbers) before the labels are written out.
+    The PLYs this stage writes are what ForAINet trains on, so the labels must
+    already be in ForAINet's scheme — the reclassification cannot wait until after
+    training data has been produced. The rule comes from the shared ``classes:``
+    config block via :mod:`pipeline.classes`, the same one the class-unifier stage
+    applies, so the two cannot drift.
+
+    ``class_map=None``/empty keeps the old behaviour (a straight copy) for callers
+    that have no scheme configured.
+
+    The mask is returned rather than applied because the caller must subset the
+    coordinates, intensity and tree ids the same way.
     """
-    return labels.astype(np.uint8)
+    if not class_map:
+        return labels.astype(np.uint8), np.ones(len(labels), dtype=bool), 0
+    return remap_and_filter(labels, class_map, drop_value, plot)
 
 
 def _crs_wkt(header: laspy.LasHeader) -> Optional[str]:
@@ -311,14 +330,31 @@ def _preprocess_one(
     semantic_field: Optional[str] = None,
     tree_id_field: Optional[str] = None,
     intensity_field: Optional[str] = None,
+    class_map: Optional[Dict[int, int]] = None,
+    drop_value: Optional[int] = None,
 ) -> int:
     """Center one cloud, write ``<plot>.ply`` + ``<plot>_offsets.yml``.
 
-    Returns the point count.
+    Returns the point count actually written (after any class-based dropping).
     """
     xyz, intensity, semantic, tree_id, meta = _read_cloud(
         src_path, semantic_field, tree_id_field, intensity_field)
+
+    # Reclassify FIRST, and drop the classes with no counterpart in the target
+    # scheme, because everything below describes the points that end up in the PLY:
+    # the offsets are the surviving points' minima, and `restore` later validates a
+    # cloud against exactly these statistics (n_points, original_min_*, ranges).
+    # Dropping after centering would leave those describing points that are gone.
+    labels, keep, n_dropped = _semantic_labels(semantic, class_map, drop_value, plot)
+    if n_dropped:
+        dropped_values = [int(v) for v in np.unique(np.asarray(semantic)[~keep])]
+        xyz, intensity, tree_id = xyz[keep], intensity[keep], tree_id[keep]
+        log.info("[%s] dropped %s point(s) from source class(es) %s",
+                 plot, f"{n_dropped:,}", dropped_values)
     n_points = len(xyz)
+    if n_points == 0:
+        raise ValueError(
+            f"[{plot}] every point was dropped by the class map — nothing to write")
 
     # The shifts are the per-axis minima: subtracting them guarantees every
     # coordinate is >= 0 (ForAINet's requirement), with 0 at the plot corner.
@@ -331,7 +367,7 @@ def _preprocess_one(
     array["y"] = xyz[:, 1] - offset_y
     array["z"] = xyz[:, 2] - offset_z
     array["intensity"] = intensity.astype(np.float64)
-    array["semantic_seg"] = _semantic_labels(semantic)
+    array["semantic_seg"] = labels
     array["treeID"] = tree_id.astype(np.uint32)
 
     ply_path = out_dir / f"{plot}.ply"
@@ -352,6 +388,11 @@ def _preprocess_one(
         "original_range_y": float(np.ptp(xyz[:, 1])),
         "original_range_z": float(np.ptp(xyz[:, 2])),
         "n_points": int(n_points),
+        # How many source points the class map discarded. n_points above counts only
+        # what the PLY holds, so a restored cloud is intentionally smaller than the
+        # Stage 1 input it came from.
+        "n_points_source": int(len(keep)),
+        "n_points_dropped": int(n_dropped),
         **meta,
     }
     offsets_path = out_dir / f"{plot}_offsets.yml"
@@ -434,6 +475,8 @@ def prep_forainet(
     semantic_field: Optional[str] = None,
     tree_id_field: Optional[str] = None,
     intensity_field: Optional[str] = None,
+    class_map: Optional[Dict[int, int]] = None,
+    drop_value: Optional[int] = None,
     restore_dir: Optional[str] = None,
     offsets_dir: Optional[str] = None,
     restore_format: str = "laz",
@@ -469,6 +512,14 @@ def prep_forainet(
         ``intensity``/``scalar_Intensity``/...). Set explicitly for data whose
         ground truth lives in a differently named field; a configured name missing
         from a file fails that plot loudly (instead of silently writing zeros).
+    class_map, drop_value:
+        (preprocess) The semantic scheme the PLYs are written in — ForAINet trains
+        on these files, so the labels must already be remapped here. ``class_map``
+        is ``{source: unified}`` and must cover **every** class present (an unmapped
+        value fails that plot); points mapped to ``drop_value`` are removed before
+        centering, so the offsets file describes exactly the points in the PLY.
+        Both come from the shared ``classes:`` block of ``conf/config.yaml``, which
+        the class-unifier stage reads too. ``None`` = copy the labels unchanged.
     restore_dir:
         (restore) Folder of classified ``*.ply`` files to restore. **Required** in
         restore mode. Files already named ``restored_*`` are ignored.
@@ -492,6 +543,14 @@ def prep_forainet(
     """
     if mode not in ("preprocess", "restore"):
         raise ValueError(f"mode must be 'preprocess' or 'restore', got {mode!r}")
+
+    # OmegaConf hands dict keys over as strings; the label columns are integers.
+    class_map = {int(k): int(v) for k, v in (class_map or {}).items()}
+    if mode == "preprocess" and class_map:
+        log.info("Applying class map (%d source class(es) -> %s)%s",
+                 len(class_map), sorted({int(v) for v in class_map.values()}),
+                 "" if drop_value is None else
+                 f"; points mapping to {drop_value} are dropped")
 
     wanted = set(plots) if plots else None
     succeeded: List[str] = []
@@ -541,7 +600,8 @@ def prep_forainet(
             out_dir.mkdir(parents=True, exist_ok=True)
             try:
                 _preprocess_one(src_path, plot, out_dir,
-                                semantic_field, tree_id_field, intensity_field)
+                                semantic_field, tree_id_field, intensity_field,
+                                class_map, drop_value)
                 succeeded.append(plot)
             except Exception:
                 log.exception("[%s] FAILED", plot)

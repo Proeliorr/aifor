@@ -177,6 +177,96 @@ Dates follow the Hydra run logs in `outputs/<date>/<time>/`.
   refactor; and `view_cloud_3d.py --smoke` off-screen renders for **both** colouring
   branches (PNGs inspected, payload cleanup and a missing-payload exit code checked).
 
+## 2026-07-27 — SegmentedForests → ForAINet class scheme (4 classes, strict, shared)
+
+- **The mapping is live in both stages.** A new shared `classes:` block in
+  `conf/config.yaml` defines the scheme once; `class_unifier:` and `forainet_prep:`
+  interpolate it, so the `.npy` inspection exports and the PLYs ForAINet actually trains
+  on cannot drift. The rule lives in the new **`pipeline/classes.py`** — a neutral module
+  because `class_unifier` already imports the reader from `forainet_prep`, so the reverse
+  import would be circular.
+- **Map** (`Class` → `semantic_seg`): `8,9,11 → -1` (dropped) · `0,4,5,6,7,12,13,22,23 → 0`
+  · `1 → 1` · `3,10 → 2` · `2 → 3`. Verified before implementing: the union of `Class`
+  over all 14 plots is exactly those 16 values, no gaps or overlaps. Per-plot vocabularies
+  differ a lot (`plot_01`: `0–4`; `plot_10`: `0–5,11,12,13,22,23`), which is why an early
+  identity run on `plot_01` had looked like a tidy 5-class dataset.
+- **`-1` removes points**, it is not an ignore label. In Stage 2 the drop happens *before*
+  the centering minima are computed, so `<plot>_offsets.yml` describes the points actually
+  in the PLY — `restore` validates against those, and would otherwise fail. New keys
+  `n_points_source` / `n_points_dropped` record the difference; the class-unifier sidecar
+  gains `dropped_points` / `dropped_source_values`.
+- **Strict by design**: `unmapped_value` is gone. A source class missing from `class_map`
+  raises and fails that plot, naming the offending values. Guessing (keep-as-is, or force
+  to a default) would put a bogus class into training.
+- **ForAINet is now a 4-class problem.** Class 4 `branches` has no SegmentedForests
+  counterpart, so `Treeins_NUM_CLASSES 5→4`, `INV_OBJECT_LABEL`/`CLASSES_INV`/`OBJECT_COLOR`
+  lose it, `VALID_CLASS_IDS → [0,1,2,3]`, and `SemIDforInstance [2,3,4] → [2,3]` (tree
+  instances now come from stem_points + live_branches only). The panoptic eval counters are
+  1-based and shifted, so `NUM_CLASSES_sem 6→5`, `sem_classcount → [1,2,3,4]`,
+  `thing_classes → [3,4]`. Deliberately left alone: `NUM_CLASSES = 3` (it counts the binary
+  stuff/thing scheme, independent of the fine class count) and the dead, never-referenced
+  `NUM_CLASSES_count`. Edits captured in `patches/forainet-local.patch` (now 5 files) and
+  the patch was proven to reapply onto a pristine submodule checkout.
+- **Hydra gotcha corrected by measurement.** The old note ("CLI dict overrides merge")
+  was only half right. With integer keys: `classes.class_map.5=1` and
+  `classes.class_map={99: 0}` both fail with *"Key ... is not in struct"*;
+  `++classes.class_map={99: 0}` merges; and `class_unifier.class_map={...}` **replaces**
+  that stage's map, severing the link to the shared block so Stage 2 quietly keeps the old
+  one. Change the scheme by editing the file.
+- Verified on `plot_10` (richest vocabulary, 42,511,997 pts): strict failure on an
+  incomplete map writes nothing; exact conservation (every source count lands in the right
+  bucket, e.g. 7 sources → class 0 = 15,228,253); 269,800 points of class 11 dropped;
+  `.npy`, `.ply` and `offsets.yml` all agree at 42,242,197 points with `semantic_seg`
+  `{0,1,2,3}` as `uint8`, coordinates ≥ 0 with minima ≈ 0; restore round-trips with no
+  warning.
+
+## 2026-07-27 — class_unifier `output_format` (.ply / .npy / both), default .ply
+
+- **`output_format: ply | npy | both`** added to the `class_unifier:` section; the
+  `.json` sidecar is written either way and now records `output_format` + `files`.
+- **Why the default changed to `ply`.** The old `N×7` float64 `.npy` was actively hard to
+  inspect in `misc/view_split_point_cloud.ipynb`: the viewer decides colouring with
+  `discrete = np.issubdtype(dtype, np.integer) and n_unique <= 20`, which a float64
+  column can never satisfy — so `Class`/`semantic_seg`/`tree_ID` drew as a viridis ramp
+  with no legend, `summarize_fields` printed `-` in the *Unique* column, and the
+  histogram fell back to generic bins. The stage exists to check a class merge, and its
+  own export format defeated exactly that.
+- The PLY carries the **same 7 columns** (source label kept next to the unified one, so
+  one file supports the before/after comparison) with each column's **native dtype** —
+  verified on plot_10: `intensity` u2, `Class` i1, `semantic_seg` u1, `tree_ID` i4.
+  `color_spec` now returns `discrete=True` for both label columns (4 and 10 classes) and
+  the statistics table shows real unique counts. Also smaller: **1289 MB vs 2256 MB**
+  (57%), ~32 vs 56 bytes/point.
+- Coordinates stay **original** (no centering): that is Stage 2's job, together with the
+  `<plot>_offsets.yml` that makes it reversible. This export is diagnostic, not a second
+  ForAINet producer.
+- Reuses Stage 2's `_write_ply`; the two writers are split into `_write_ply_cloud` /
+  `_write_npy_matrix`. `overwrite=false` now tests the files for the *selected* format
+  (and for `both` only skips when both exist, so a half-finished run completes), and a
+  leftover file from a previous run in the other format is warned about — the shared
+  sidecar would otherwise let the viewer open stale data.
+- Verified: invalid format rejected; plot_10 as `.ply` (42,242,197 pts, `semantic_seg`
+  ⊆ {0,1,2,3}, `Class` still holding pre-merge values); `both` writes the pair; `npy`
+  reproduces the legacy float64 layout; skip and half-finished-skip behave.
+
+## 2026-07-27 — 3-D view: reset-view button
+
+- **`misc/view_cloud_3d.py`** gained a **reset view** button in the bottom-left corner
+  (x=220 px, clearing the orientation-axes gizmo), plus the same action on the `r` key.
+  PyVista has no plain push-button, so the checkbox widget is used as one with identical
+  on/off colours; the click is what matters, not the state.
+- Deliberately **stronger than VTK's built-in `r`**, which refits the bounds but keeps
+  whatever orientation you rotated to. Re-applying the isometric camera *before*
+  `reset_camera()` makes reset land on the same view every time, so that key is rebound.
+- `_add_reset_view` returns the reset callable — the very one the button and key invoke
+  — so tests exercise the real closure instead of a copy.
+- Widgets need a live interactor, so the button is skipped (not attempted) under
+  `--smoke` / off-screen rendering; the `r` binding still applies.
+- Verified: off-screen smoke unaffected; one button widget attaches; after an
+  orbit+zoom the camera returns **exactly** to the opening position
+  (`[125.88 128.06 127.14]` → moved → identical again); `r` confirmed bound via
+  `clear_events_for_key(raise_on_missing=True)`; placement eyeballed on a screenshot.
+
 ---
 
 ## Planned

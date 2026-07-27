@@ -107,12 +107,58 @@ def build_plotter(payload: dict, off_screen: bool = False):
     # it stays OFF by default and is offered as a toggle instead.
     # NOTE: do not bind this to 'e' -- PyVista already uses 'e' (and 'q') to exit.
     _add_edl_toggle(plotter)
+    _add_reset_view(plotter, off_screen)
 
+    # Keep this short: it sits over the bounding-box tick labels, and the reset
+    # button in the corner already labels itself.
     subtitle = (f"{len(xyz):,} points  |  coloured by {field}\n"
                 "drag rotate  |  scroll zoom  |  middle-drag pan  |  "
                 "r reset  |  d depth-shading  |  q close")
     plotter.add_text(subtitle, position="upper_left", font_size=9, color="white")
     return plotter
+
+
+def _add_reset_view(plotter, off_screen: bool = False):
+    """Restore the opening view, from a corner button or the 'r' key.
+
+    After orbiting around a plot it is easy to lose the cloud off-screen entirely;
+    this puts it back the way it opened.
+
+    Note this is a stronger reset than VTK's built-in 'r', which refits the bounds
+    but keeps whatever orientation you had rotated to. Re-applying the isometric
+    camera first means "reset" returns the *same* view every time, so we deliberately
+    rebind that key.
+
+    Returns the reset callable -- the very one the button and the key both invoke, so
+    a test can exercise the real thing rather than a copy of it.
+    """
+    def reset():
+        plotter.camera_position = "iso"   # orientation back to the opening one
+        plotter.reset_camera()            # then refit the cloud's bounds
+        plotter.render()
+
+    try:
+        plotter.add_key_event("r", reset)
+    except Exception:
+        pass  # a missing shortcut must never stop the window from opening
+
+    # Widgets need a live interactor, which an off-screen render does not have.
+    if off_screen:
+        return reset
+    try:
+        # PyVista only offers a checkbox widget, so it is used as a push button:
+        # the click is what matters, and identical on/off colours keep it from
+        # looking like a toggle that is now "on". x=220 clears the orientation
+        # axes widget in the bottom-left corner.
+        plotter.add_checkbox_button_widget(
+            lambda _state: reset(),
+            value=False, position=(220.0, 12.0), size=26, border_size=2,
+            color_on="#4a7ebb", color_off="#4a7ebb", background_color="#e8e8e8",
+        )
+        plotter.add_text("reset view", position=(252, 16), font_size=8, color="white")
+    except Exception as exc:  # pragma: no cover - depends on the VTK build
+        print(f"reset-view button unavailable ({exc}); the 'r' key still works")
+    return reset
 
 
 def _add_edl_toggle(plotter) -> None:

@@ -59,19 +59,107 @@ The development history — what was added when and why — is tracked in
 
 ---
 
+## Dataset
+
+The plot clouds are **not part of this repository** — they come from the public
+**SegmentedForests** dataset: 14 terrestrial-LiDAR forest plots, over 920 million
+labelled points, which is what `plot_01 … plot_14` refer to throughout.
+
+| | |
+|---|---|
+| **Download** | [Zenodo record 17396681](https://zenodo.org/records/17396681) — one file, `SegmentedForests.zip` (4.4 GiB, MD5 `757d1d92924702e48637dd18647ab517`) |
+| **Dataset DOI** | [10.5281/zenodo.17396681](https://doi.org/10.5281/zenodo.17396681) — this is **v1.0**, and the one to pin. The concept DOI [10.5281/zenodo.17396680](https://doi.org/10.5281/zenodo.17396680) always resolves to the newest version, so it is not reproducible. |
+| **Paper** | [10.1093/forestry/cpaf062](https://doi.org/10.1093/forestry/cpaf062) |
+| **License** | MIT — redistribution permitted with attribution |
+
+### Citation
+
+Cite the paper (and, for the exact data, the versioned Zenodo DOI above):
+
+> Laino, D., Cabo, C., Ordóñez, C., Bolanos, R., Janvier, R., Giulioni, F., Herrmann, M.,
+> Hudak, A., Parsons, R., & Santin, C. (2026). SegmentedForests: a labelled dataset of
+> terrestrial LiDAR point clouds for semantic segmentation of forests. *Forestry: An
+> International Journal of Forest Research*, **99**(2), cpaf062.
+> <https://doi.org/10.1093/forestry/cpaf062>
+
 ## Dataset layout
 
 ```
 SegmentedForests/
-├── pointclouds/          # input clouds:  plot_01.laz … plot_14.laz
+├── pointclouds/          # input clouds:  plot_01.laz … plot_14.laz   <-- unzip the download here
 ├── 3DFin_settings/       # per-plot 3DFin params: plot_01.ini … plot_14.ini (+ README.txt)
 ├── 3DFin_output/         # Stage 1 results, one subfolder per plot (created by the runner)
 │   └── plot_01/ …
 └── ForAINet_input/       # Stage 2 results: plot_01.ply + plot_01_offsets.yml … (created by forainet_prep)
 ```
 
+**Where to put the download:** extract `SegmentedForests.zip` so the 14 plot clouds end up
+directly in `SegmentedForests/pointclouds/` as `plot_01.laz … plot_14.laz` (flatten any
+extra nesting the archive introduces). Verifying the MD5 above before unzipping is worth
+the minute — a truncated 4.4 GiB download otherwise surfaces much later as a corrupt-LAZ
+error inside Stage 1.
+
+These folders ship in git as **empty placeholders** (the paths are hardcoded in
+`conf/config.yaml`), so a fresh clone already has the structure — only the data is missing.
+The `3DFin_settings/*.ini` files *are* tracked, so you do not need to obtain those
+separately.
+
 Each `<plot>.laz` must have a matching `<plot>.ini`. Plots with no `.ini` are **skipped**
 with a warning.
+
+### Semantic classes: SegmentedForests → ForAINet
+
+The dataset's `Class` field and ForAINet's `semantic_seg` use different vocabularies, so
+the labels are remapped. The scheme is defined **once** in the `classes:` block of
+[`conf/config.yaml`](conf/config.yaml) and used by both the class unifier and Stage 2, so
+the inspection exports and the clouds ForAINet trains on cannot disagree.
+
+| SegmentedForests `Class` | → ForAINet | Meaning |
+|---|---|---|
+| 0, 4, 5, 6, 7, 12, 13, 22, 23 | **0** | low_vegetation |
+| 1 | **1** | ground |
+| 3, 10 | **2** | stem_points |
+| 2 | **3** | live_branches |
+| 8, 9, 11 | **−1** | no counterpart — **these points are removed** |
+
+Verified against the data: the union of `Class` over all 14 plots is exactly those 16
+values (individual plots differ — `plot_01` has only `0–4`, `plot_10` has
+`0–5, 11, 12, 13, 22, 23`).
+
+Two consequences worth knowing:
+
+- **The map must be total.** A class present in the data but missing from `class_map`
+  **fails that plot** rather than being silently kept or forced to a default — an
+  unmapped label would otherwise reach training as a bogus class.
+- **Output is smaller than input.** Dropped points are removed before the coordinates are
+  centered, so `<plot>_offsets.yml` describes exactly the points in the PLY. A cloud put
+  back through `mode=restore` is therefore not a point-for-point match of the 3DFin input
+  (`n_points_source` and `n_points_dropped` in the offsets file record the difference).
+
+ForAINet's fifth class (`branches`) receives nothing and was removed from the framework
+itself — those edits live in [`patches/forainet-local.patch`](patches/README.md), since
+`ForAINet/` is a pinned submodule.
+
+#### Checking the merge did what you meant
+
+`class_unifier.py` applies the same map and writes an inspection copy of each plot to
+`SegmentedForests/ClassUnifier_output/`, keeping the **source label next to the unified
+one** so both can be seen in one file:
+
+```bash
+mamba run -n aifor python class_unifier.py                     # all plots -> .ply
+mamba run -n aifor python class_unifier.py class_unifier.plots=[plot_10]
+```
+
+Open the result in [`misc/view_split_point_cloud.ipynb`](misc/README.md) and colour by
+`Class` in one panel and `semantic_seg` in the other.
+
+`output_format` chooses what it writes — **`ply` (default)**, `npy`, or `both`; the
+`.json` sidecar with the provenance (map used, drop counts, per-class counts before and
+after) is written either way. Prefer the PLY for viewing: the viewer only draws class
+colours, a legend and unique counts for **integer** columns, and the `.npy` is a single
+float64 matrix, so every label in it renders as a continuous ramp instead. The PLY is
+also smaller (~32 vs 56 bytes/point — 1289 MB vs 2256 MB for plot_10).
 
 ---
 

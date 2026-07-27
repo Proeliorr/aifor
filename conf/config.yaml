@@ -3,6 +3,77 @@
 # prefix, e.g. `threedfin.plots=[plot_01]` or `threedfin.dry_run=true`.
 
 # ============================================================================
+# Semantic class scheme — SegmentedForests labels -> ForAINet labels
+#
+# Defined ONCE here and interpolated by both stages that touch labels
+# (`class_unifier:` and `forainet_prep:`), so the .npy exports and the PLYs
+# ForAINet actually trains on can never disagree.
+#
+# Nothing about this block is ForAINet-specific machinery — it is plain config.
+# Pointing the pipeline at another dataset means a different `class_map` and
+# field names, not a code change; the scheme below is simply the default.
+#
+# HYDRA GOTCHA (measured, not guessed — the keys here are INTEGERS, which makes
+# CLI overrides awkward):
+#   classes.class_map.5=1        -> FAILS "Key '5' is not in struct" (the override
+#                                   parser hands over a string key; the map's are ints)
+#   classes.class_map={99: 0}    -> FAILS the same way (it merges into a struct)
+#   ++classes.class_map={99: 0}  -> merges, adding that entry (17 entries)
+#   class_unifier.class_map={..} -> REPLACES the stage's map wholesale, severing the
+#                                   link to this block, so forainet_prep still uses
+#                                   the one below and the two stages disagree
+# In short: change the scheme by editing this file. Reserve the CLI for one-off
+# experiments, and never for a run whose output feeds training.
+# ============================================================================
+classes:
+  # Source column holding the ground-truth label, and the tree/instance id.
+  # Stated explicitly rather than left to auto-detection: picking the wrong
+  # column silently is exactly the failure mode this stage exists to prevent.
+  semantic_field: Class
+  tree_id_field: tree_ID
+  # Name of the NEW column receiving the remapped labels.
+  unified_field: semantic_seg
+
+  # Points whose mapped label equals `drop_value` are REMOVED from the output
+  # (they have no ForAINet counterpart). null = keep everything.
+  drop_value: -1
+
+  # {SegmentedForests Class: ForAINet semantic_seg}. Several sources sharing a
+  # target merge those classes. Verified complete against all 14 plots: the
+  # union of `Class` over the dataset is exactly the 16 keys below.
+  class_map:
+    # no ForAINet counterpart -> dropped
+    8: -1
+    9: -1
+    11: -1
+    # -> 0 low_vegetation
+    0: 0
+    4: 0
+    5: 0
+    6: 0
+    7: 0
+    12: 0
+    13: 0
+    22: 0
+    23: 0
+    # -> 1 ground
+    1: 1
+    # -> 2 stem_points
+    3: 2
+    10: 2
+    # -> 3 live_branches
+    2: 3
+
+  # The unified scheme, echoed into every sidecar. ForAINet's class 4
+  # ("branches") is absent: SegmentedForests has no corresponding label, so it
+  # was removed from the framework too (see patches/forainet-local.patch).
+  class_names:
+    0: low_vegetation
+    1: ground
+    2: stem_points
+    3: live_branches
+
+# ============================================================================
 # Stage 1 — 3DFin instance segmentation
 #   run with: python main_pipeline.py   (engine: pipeline/threedfin.py)
 # ============================================================================
@@ -41,48 +112,41 @@ class_unifier:
   # output tree). Default input = Stage 1 results.
   input_dir:  D:\Podyplomowe\04_AI_Intro\assignment\SegmentedForests\3DFin_output
   patterns: ["*.las", "*.laz", "*.ply"]
-  # Folder receiving <plot>.npy + <plot>.json (created if missing).
+  # Folder receiving <plot>.<ply|npy> + <plot>.json (created if missing).
   output_dir: D:\Podyplomowe\04_AI_Intro\assignment\SegmentedForests\ClassUnifier_output
 
+  # What to write: ply | npy | both. The .json sidecar is written either way.
+  #
+  # `ply` (default) is the one to inspect in misc/view_split_point_cloud.ipynb: a PLY
+  # keeps each column's real dtype, and the viewer only draws a class legend (and
+  # unique counts, and one histogram bar per class) for INTEGER columns. The .npy is a
+  # plain float64 matrix, so there every label column looks continuous — a viridis ramp
+  # instead of the class colours, which defeats the point of checking a merge. The PLY
+  # is smaller too (~32 vs 56 bytes/point).
+  #
+  # `npy` stays available for loading straight into numpy; `both` writes the pair.
+  output_format: ply
+
   # --- Source field names ---
-  # Which source columns hold the semantic label, tree/instance id and intensity.
-  # null = auto-detect (semantic: Class/semantic_seg/classification; tree id:
-  # tree_ID/treeID; intensity: intensity/scalar_Intensity/...). Set explicitly for
-  # data whose ground truth lives under a different name — a configured name missing
-  # from a file fails that plot loudly instead of silently writing zeros.
-  semantic_field: null
-  tree_id_field: null
+  # Taken from the shared `classes:` block above. intensity has no bearing on the
+  # label scheme, so it stays local; null = auto-detect
+  # (intensity/scalar_Intensity/...). A configured name missing from a file fails
+  # that plot loudly instead of silently writing zeros.
+  semantic_field: ${classes.semantic_field}
+  tree_id_field: ${classes.tree_id_field}
   intensity_field: null
 
-  # --- The unification ---
-  # Name of the NEW column receiving the remapped labels (the source column is kept
-  # unchanged next to it).
-  unified_field: semantic_seg
-  # {source: unified} value mapping. MERGES are expressed by giving several sources
-  # the same target, e.g. {1: 2, 4: 2} folds classes 1 and 4 into class 2.
-  # Identity by default — edit when the real correspondence is known. CLI override:
-  #   "class_unifier.class_map={0: 0, 1: 2, 2: 2, 3: 3, 4: 2}"
-  class_map:
-    0: 0
-    1: 1
-    2: 2
-    3: 3
-    4: 4
-  # Source values absent from class_map: null = keep as-is (with a warning listing
-  # them); an integer = force that value (e.g. 0 = "unclassified").
-  unmapped_value: null
-  # {value: name} documentation of the unified scheme, echoed into each sidecar.
-  # Defaults to ForAINet's five classes (see ForAINet's treeins_set1 datasets).
-  class_names:
-    0: low_vegetation
-    1: ground
-    2: stem_points
-    3: live_branches
-    4: branches
+  # --- The unification (shared with forainet_prep; see `classes:` above) ---
+  unified_field: ${classes.unified_field}
+  class_map: ${classes.class_map}
+  drop_value: ${classes.drop_value}
+  class_names: ${classes.class_names}
 
   # --- Run control ---
   plots: null               # null = all plots; or a list like [plot_01, plot_05]
-  overwrite: true           # false = skip plots whose <plot>.npy already exists
+  # false = skip plots whose output for the SELECTED output_format already exists
+  # (with `both`, only when the .ply and the .npy are both there).
+  overwrite: true
   dry_run: false
   continue_on_error: true
 
@@ -109,14 +173,21 @@ forainet_prep:
   output_dir: D:\Podyplomowe\04_AI_Intro\assignment\SegmentedForests\ForAINet_input
 
   # --- preprocess mode: source field names ---
-  # Which source fields hold the ground-truth semantic label, the tree/instance id
-  # and the intensity. null = auto-detect (semantic: Class/semantic_seg/classification;
-  # tree id: tree_ID/treeID; intensity: intensity/scalar_Intensity/...). Set explicitly
-  # for data with differently named ground-truth fields — a configured name missing
+  # Label and tree-id columns come from the shared `classes:` block at the top of
+  # this file. intensity is unrelated to the label scheme, so it stays local;
+  # null = auto-detect (intensity/scalar_Intensity/...). A configured name missing
   # from a file fails that plot loudly instead of silently writing zeros.
-  semantic_field: null
-  tree_id_field: null
+  semantic_field: ${classes.semantic_field}
+  tree_id_field: ${classes.tree_id_field}
   intensity_field: null
+
+  # --- preprocess mode: the class scheme (SAME map as class_unifier) ---
+  # The PLYs written here are what ForAINet trains on, so they carry the unified
+  # labels; without this the framework would still see the raw source classes.
+  # Points mapped to `drop_value` are removed BEFORE centering, so the offsets and
+  # statistics in <plot>_offsets.yml describe exactly the points in the PLY.
+  class_map: ${classes.class_map}
+  drop_value: ${classes.drop_value}
 
   # --- restore mode ---
   restore_dir: null         # folder of classified *.ply to restore (required for mode=restore)

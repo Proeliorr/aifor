@@ -24,6 +24,11 @@ SegmentedForests/**
 # to them stay ignored by the rule above.
 !SegmentedForests/ForAINet_input/*_offsets.yml
 
+# Class-unifier provenance sidecars (column names/dtypes, class_map, per-class
+# counts) are a few KB and worth versioning -- the N x 7 .npy matrix beside them
+# is ~1 GB and regenerable, so it stays ignored.
+!SegmentedForests/ClassUnifier_output/*.json
+
 # Per-run Hydra logs
 outputs/
 
@@ -37,6 +42,9 @@ misc/offset.yml
 
 # Working area for data pulled out of the repo (e.g. the old .ply training set)
 temp_removed/
+
+# Archived training dataset (~1 GB zip): kept on disk, never in git.
+old_training_dataset/
 
 # ---------------------------------------------------------------------------
 # ForAINet/ is a SUBMODULE -- nothing here applies inside it.

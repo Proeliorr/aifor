@@ -127,6 +127,56 @@ Dates follow the Hydra run logs in `outputs/<date>/<time>/`.
   1,2→2 gives 13,201,561; synthetic PLY covers both `unmapped_value` branches;
   viewer loads the npy+json with names restored and zero warnings.
 
+## 2026-07-24 — Viewer diagnostics: histogram, unique-values, wheel-zoom, field picker
+
+- **`misc/view_split_point_cloud.ipynb`** gained five inspection features (motivated by
+  wide id fields like `tree_ID`, 0…~60 000, where the existing stats gave no way to see
+  which ids are real):
+  - **Histogram** pop-up and a sortable **Unique values** table (value / count / %) for
+    the current *Colour by* field; each has a *respect active filter* toggle
+    (off = whole cloud). The unique-values table is capped at 100k rows (suggests a
+    range filter beyond that).
+  - **Mouse-wheel zoom-to-cursor** on any of the five spatial views (toolbar Home resets).
+  - **Fields shown…** picker choosing which fields the statistics box lists (all shown
+    by default, untick the noise).
+  - Info-box header line now carries the **LAS version + point-format id**
+    (`LAS/LAZ  1.4 (PF 6)`), read via `str(las.header.version)` / `las.point_format.id`
+    — same idiom as `pipeline/forainet_prep.py`.
+- **Window-resize fix**: the canvas is hosted in a `pack_propagate(False)` frame so it
+  can shrink after the first `draw()`. Previously the canvas pinned the window to the
+  figure's pixel size, so resizing "stopped working" once a cloud was loaded;
+  `root.minsize(900, 600)` sets a floor.
+- `summarize_fields` / `cloud_info_text` gained an optional `fields` subset argument
+  (`None` = all, previous behaviour); loaders now carry a `header` dict.
+
+## 2026-07-24 — Viewer 3-D view (PyVista, separate process)
+
+- **`misc/view_cloud_3d.py`** (new) + a **3D view** button per panel in
+  `misc/view_split_point_cloud.ipynb`: opens the **currently filtered selection** in a
+  real OpenGL window — left-drag rotate, scroll zoom, middle-drag pan, `r` reset,
+  `d` depth-shading toggle, `q` close. 2-D remains the default view.
+- **Open3D could not be used**: the `aifor` env is Python 3.13 and Open3D publishes no
+  cp313 wheels (`pip install open3d` → *no matching distribution*). **PyVista 0.48.4 +
+  VTK 9.6.2** (cp313 wheels, `requires_python >=3.10`) replace it.
+- **Runs as a separate process** (temp `.npz` handed over, child deletes it): VTK and
+  tkinter each want the event loop, so nesting them freezes the 2-D window. As its own
+  process the 2-D viewer stays live and Cloud A + Cloud B can both have a 3-D window
+  open. The child's stdout/stderr go to a `.log` next to the payload so a GPU/VTK
+  failure is diagnosable instead of silent.
+- Own point budget (**3D max pts**, default 500 000) separate from the 2-D
+  `Max points`; both go through the new shared `_selected_indices()` with the same
+  fixed seed, so the 3-D view is a superset of the 2-D subsample.
+- Colour logic extracted into **`color_spec()`** (cell-3) and now used by *both* the
+  2-D scatter and the 3-D export, so the two can't drift: tab20 + legend for ≤ 20
+  integer labels, viridis + scalar bar otherwise.
+- **Eye-dome lighting defaults OFF**: measured on the off-screen renders it crushed
+  mean point brightness from ~104 to ~6 (sparse) / ~125 to ~33 (dense), i.e. a nearly
+  black cloud. Kept as the `d` toggle instead (not `e` — PyVista binds that to exit).
+- Verified headlessly: notebook cells exec; `color_spec` discrete/continuous/wide-id
+  branches; `_selected_indices` mask + budget; 2-D `redraw()` still fine after the
+  refactor; and `view_cloud_3d.py --smoke` off-screen renders for **both** colouring
+  branches (PNGs inspected, payload cleanup and a missing-payload exit code checked).
+
 ---
 
 ## Planned

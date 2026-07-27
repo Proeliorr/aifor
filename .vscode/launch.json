@@ -11,11 +11,11 @@
       },
       "pathMappings": [
         {
-          "localRoot": "${workspaceFolder}",
-          "remoteRoot": "/workspace"
+          "localRoot": "${workspaceFolder}/ForAINet/PointCloudSegmentation",
+          "remoteRoot": "/workspace/PointCloudSegmentation"
         }
       ],
-      "justMyCode": true
+      "justMyCode": false
     }
   ]
 }

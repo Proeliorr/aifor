@@ -1,0 +1,59 @@
+# Docker Compose for debugging the ForAINet training entrypoint from VSCode.
+#
+# This does NOT build anything: the `for-ai-net` image is a multi-stage build that
+# is expensive / not reproducible, so we only *reference* it via `image:`.
+# See run_debugger.md for the full step-by-step debugging workflow.
+
+services:
+  for-ai-net:
+    image: for-ai-net              # existing local image — do NOT rebuild
+    container_name: ai-debug-session
+
+    # Interactive terminal (equivalent to `docker run -it`), so `docker compose exec`
+    # gives us a usable shell.
+    stdin_open: true               # -i  (keep STDIN open)
+    tty: true                      # -t  (allocate a pseudo-TTY)
+
+    # The training entrypoint lives here; commands in run_debugger.md assume this cwd.
+    working_dir: /workspace/PointCloudSegmentation
+
+    # PyTorch DataLoader workers (num_workers > 0) pass batches through /dev/shm.
+    # Docker defaults it to a tiny 64MB, which point-cloud batches exhaust -> workers die
+    # with "Bus error" / "DataLoader worker exited unexpectedly". Raise it.
+    # Alternative: `ipc: host` (uses the host's shm, effectively unlimited, but less isolated).
+    # shm_size: "8gb"
+
+    ports:
+      - "5678:5678"                # debugpy listener -> VSCode remote attach
+
+    volumes:
+      # Mount the local ForAINet folder as /workspace. This MUST stay in sync with
+      # .vscode/launch.json, whose pathMappings use:
+      #   localRoot:  ${workspaceFolder}/ForAINet/PointCloudSegmentation
+      #   remoteRoot: /workspace/PointCloudSegmentation
+      # That pair is a sub-slice of this mount: because the compose file sits at the repo
+      # root, ./ForAINet == ${workspaceFolder}/ForAINet, so ./ForAINet/PointCloudSegmentation
+      # maps to /workspace/PointCloudSegmentation. Mapping the subdir (rather than the mount
+      # root) is equivalent — debugpy matches paths by prefix — and points at the training
+      # entrypoint's actual cwd (see working_dir above).
+      - ./ForAINet:/workspace
+
+    # GPU access. Requires the NVIDIA Container Toolkit on the host.
+    # This is the modern Compose v2 syntax.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    # Older Docker/Compose ignore the deploy.devices block above. If `nvidia-smi`
+    # does not see the GPU inside the container, comment the whole `deploy:` block
+    # out and use the legacy runtime instead (also needs the NVIDIA Container Toolkit):
+    #
+    #   runtime: nvidia
+    #
+
+    # Keep the container running so we can `exec` into it and launch debugpy by hand.
+    command: sleep infinity

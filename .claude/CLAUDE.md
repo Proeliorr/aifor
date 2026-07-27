@@ -63,5 +63,11 @@ on other machines.
 
 - `misc/`: standalone tools (per-tree splitter with own config; original
   `Points2ForAINet.py` converter).
-- `ForAINet/`: clone of https://github.com/prs-eth/ForAINet.git (gitignored, not a
-  submodule yet) — the deep-learning segmentation framework itself.
+- `ForAINet/`: **git submodule** of https://github.com/prs-eth/ForAINet.git, pinned at
+  `5fe600a` — the deep-learning segmentation framework itself. Get it with
+  `git submodule update --init`. Our local edits (debug training config, wandb entity,
+  `debugpy` in `train.py`) are **not** stored by this repo — a submodule only records a
+  commit SHA — so they live in `patches/forainet-local.patch`; reapply with
+  `cd ForAINet && git apply ../patches/forainet-local.patch`. See `patches/README.md`.
+  Upstream commits `__pycache__/*.pyc`, so training runs leave the submodule dirty with
+  ~115 `.pyc` entries — harmless noise.

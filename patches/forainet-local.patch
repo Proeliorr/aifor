@@ -1,0 +1,85 @@
+diff --git a/PointCloudSegmentation/conf/training/default.yaml b/PointCloudSegmentation/conf/training/default.yaml
+index e07724b..7af3899 100644
+--- a/PointCloudSegmentation/conf/training/default.yaml
++++ b/PointCloudSegmentation/conf/training/default.yaml
+@@ -1,8 +1,8 @@
+ # @package training
+ # Those arguments defines the training hyper-parameters
+-epochs: 100
+-num_workers: 6
+-batch_size: 16
++epochs: 5
++num_workers: 0
++batch_size: 4
+ shuffle: True
+ cuda: 0 # -1 -> no cuda otherwise takes the specified index
+ precompute_multi_scale: False # Compute multiscate features on cpu for faster training / inference
+@@ -29,15 +29,16 @@ checkpoint_dir: ""
+ # Those arguments within experiment defines which model, dataset and task to be created for benchmarking
+ # parameters for Weights and Biases
+ wandb:
+-  entity: ""
+-  project: default
++  entity: "aifor" #TO ADAPT: change to your own wandb account name
++  project: FOR-dataset #panoptic-boost
+   log: True
+-  notes:
+-  name:
++  notes: ""
++  name: "aifor" #TO ADAPT: specify name of experiment that will be shown on wandb
++  id:
+   public: True # It will be display the model within wandb log, else not.
+   config:
+-    model_name: ${model_name}
++    grid_size: ${data.grid_size}
+ 
+   # parameters for TensorBoard Visualization
+ tensorboard:
+-  log: True
++  log: False
+diff --git a/PointCloudSegmentation/conf/training/treeins_set1.yaml b/PointCloudSegmentation/conf/training/treeins_set1.yaml
+index 54b0608..0788b3f 100644
+--- a/PointCloudSegmentation/conf/training/treeins_set1.yaml
++++ b/PointCloudSegmentation/conf/training/treeins_set1.yaml
+@@ -30,11 +30,11 @@ checkpoint_dir: ""
+ # Those arguments within experiment defines which model, dataset and task to be created for benchmarking
+ # parameters for Weights and Biases
+ wandb:
+-  entity: "binbin" #TO ADAPT: change to your own wandb account name
++  entity: "aifor" #TO ADAPT: change to your own wandb team/account name
+   project: FOR-dataset #panoptic-boost
+   log: True
+   notes: "set1_5classes treeins"
+-  name: "set1_5classes treeins" #TO ADAPT: specify name of experiment that will be shown on wandb
++  name: "aifor" #TO ADAPT: specify name of experiment that will be shown on wandb
+   id:
+   public: True # It will be display the model within wandb log, else not.
+   config:
+diff --git a/PointCloudSegmentation/train.py b/PointCloudSegmentation/train.py
+index c7cbd87..7b972cb 100644
+--- a/PointCloudSegmentation/train.py
++++ b/PointCloudSegmentation/train.py
+@@ -3,17 +3,22 @@ from hydra.core.global_hydra import GlobalHydra
+ from omegaconf import OmegaConf
+ from torch_points3d.trainer import Trainer
+ import logging
++import debugpy
+ 
+ @hydra.main(config_path="conf", config_name="config")
+ def main(cfg):
++    # debugpy.breakpoint()   # add — process-initiated stop, ignores pathMappings
++
+     
+     numba_logger = logging.getLogger('numba')
+     numba_logger.setLevel(logging.WARNING)
+     OmegaConf.set_struct(cfg, False)  # This allows getattr and hasattr methods to function correctly
+     if cfg.pretty_print:
+         print(OmegaConf.to_yaml(cfg))
+-
++    
+     trainer = Trainer(cfg)
++    print(Trainer)
++    debugpy.breakpoint()   # add — process-initiated stop, ignores pathMappings
+     trainer.train()
+     #
+     # # https://github.com/facebookresearch/hydra/issues/440

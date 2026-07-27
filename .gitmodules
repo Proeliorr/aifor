@@ -1,0 +1,3 @@
+[submodule "ForAINet"]
+	path = ForAINet
+	url = https://github.com/prs-eth/ForAINet.git

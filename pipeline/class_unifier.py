@@ -62,6 +62,14 @@ from plyfile import PlyData
 # very same one (see pipeline/classes.py for why it is not defined in either
 # stage).
 from pipeline.classes import remap_and_filter
+from pipeline.parallel import (
+    DEFAULT_BYTES_PER_POINT,
+    DEFAULT_MEMORY_BUDGET_FRAC,
+    Job,
+    estimate_points,
+    replay,
+    run_jobs,
+)
 
 # Shared plumbing from Stage 2: input collection, plot-name derivation, the
 # format-agnostic reader (with the laspy np.asarray gotcha handled) and the
@@ -281,6 +289,9 @@ def unify_classes(
     overwrite: bool = True,
     dry_run: bool = False,
     continue_on_error: bool = True,
+    workers: Optional[int] = None,
+    memory_budget_frac: float = DEFAULT_MEMORY_BUDGET_FRAC,
+    bytes_per_point: int = DEFAULT_BYTES_PER_POINT,
 ) -> None:
     """Remap the semantic labels of every matched cloud and export ``.npy`` + ``.json``.
 
@@ -328,6 +339,13 @@ def unify_classes(
         Log what would be processed without reading or writing anything.
     continue_on_error:
         Keep going after a plot fails (default) or stop at the first failure.
+    workers, memory_budget_frac, bytes_per_point:
+        Parallelism. Plots are independent, so several run at once; the ceiling is
+        RAM rather than cores, because these clouds differ hugely in size (the
+        biggest here needs ~16 GB on its own). ``workers=None`` lets the memory
+        budget decide, capped by the CPU count; an integer is a hard cap;
+        ``workers=1`` runs everything inline exactly as before.
+        See ``pipeline/parallel.py``.
     """
     in_dir = Path(input_dir)
     out_dir = Path(output_dir)
@@ -369,6 +387,9 @@ def unify_classes(
     failed: List[str] = []
     skipped: List[str] = []
 
+    # Skips and dry runs are decided HERE, in the parent: they do no work, so
+    # there is nothing to parallelise and the log stays in plot order.
+    jobs: List[Job] = []
     for src in inputs:
         plot = _plot_name(src)
         out_paths = [out_dir / f"{plot}{suf}" for suf in suffixes]
@@ -390,19 +411,30 @@ def unify_classes(
             continue
 
         out_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            _unify_one(
-                src, plot, out_dir,
-                semantic_field, tree_id_field, intensity_field,
-                unified_field, class_map, drop_value, class_names, output_format,
-            )
-            succeeded.append(plot)
-        except Exception as exc:
-            log.error("[%s] FAILED: %s", plot, exc)
-            failed.append(plot)
-            if not continue_on_error:
-                log.error("continue_on_error=False — stopping after first failure.")
-                break
+        jobs.append(Job(
+            name=plot,
+            fn=_unify_one,
+            args=(src, plot, out_dir,
+                  semantic_field, tree_id_field, intensity_field,
+                  unified_field, class_map, drop_value, class_names, output_format),
+            n_points=estimate_points(src),   # header-only read; sizes its RAM share
+        ))
+
+    # Plots are independent, so run several at once -- how many is decided by
+    # memory, not cores (see pipeline/parallel.py). workers=1 stays inline.
+    for result in run_jobs(jobs, workers=workers,
+                           memory_budget_frac=memory_budget_frac,
+                           bytes_per_point=bytes_per_point,
+                           continue_on_error=continue_on_error):
+        replay(result, log)          # worker log lines reach Hydra's log file
+        if result.ok:
+            succeeded.append(result.name)
+        else:
+            log.error("[%s] FAILED: %s", result.name,
+                      (result.error or "").strip().splitlines()[-1] if result.error else "?")
+            failed.append(result.name)
+    succeeded.sort()
+    failed.sort()
 
     # --- summary ---------------------------------------------------------
     log.info("=" * 60)

@@ -48,6 +48,15 @@ module because `class_unifier` imports the reader from `forainet_prep`, so
 - Stage 2 drops points **before** computing the centering offsets, so
   `<plot>_offsets.yml` describes the points actually in the PLY (`restore` validates
   against them). A restored cloud is therefore smaller than the 3DFin input.
+- **`treeID` convention (easy to get wrong):** ForAINet needs `0` = "not part of any
+  tree", and skips any instance whose id also appears on a non-thing point. 3DFin
+  instead gives every point the nearest stem's id — ground included — which made
+  **0 of 42** instances survive on plot_10. `classes.instance_classes` ([3, 4] =
+  stem_points, live_branches, in `class_names` numbering) drives
+  `zero_stuff_tree_ids()`, clearing the id everywhere else. Do not "simplify" this away.
+- The two `-1`s are different: ours (`drop_value`) deletes rows before writing;
+  ForAINet's arrives after its `semantic_seg - 1` shift and means `ignore_index` in the
+  loss — those points stay in the cloud and keep supporting their neighbours' features.
 - Hydra gotcha (measured): the map's keys are **integers**, so
   `classes.class_map.5=1` and `classes.class_map={99: 0}` both fail with "Key ... is
   not in struct"; `++classes.class_map={99: 0}` merges; and
@@ -85,6 +94,18 @@ on other machines.
   `continue_on_error`, `=`-rule summary log line.
 - laspy gotcha: materialise accessors with `np.asarray(...)` (ScaledArrayView /
   SubFieldView are not plain arrays).
+- **Parallelism** (`pipeline/parallel.py`): `class_unifier`, `forainet_prep` and
+  `misc/tree_splitter` run several plots at once in worker *processes*; 3DFin
+  (Stage 1) stays sequential. Concurrency is bounded by **RAM, not cores** — Stage 2
+  costs a measured ~134 bytes/point, so plot_08 (280 M pts) needs ~37 GB alone and a
+  worker per core would exhaust the machine. Sizes come from LAS headers; work is
+  admitted while it fits `memory_budget_frac` of RAM. `workers: 1` = inline, the old
+  behaviour exactly. Worker log lines are replayed by the parent so Hydra's log keeps
+  the per-plot detail. Full 14-plot Stage 2: 3.3 → 2.4 min (plot_08 alone is 33% of
+  all points, so it sets the floor).
+- A full 14-plot Stage 2 run writes **~25 GB**. Benchmarks and scratch output belong on
+  `D:`, not the default temp on `C:` — filling the system drive surfaces as confusing
+  failures deep inside `plyfile`'s write.
 - Planned work is listed at the bottom of `progress.md`. Label reclassification is
   **done**: it ships both as the standalone `class_unifier` stage and, via
   `_semantic_labels()` in `pipeline/forainet_prep.py`, in the Stage 2 PLYs ForAINet

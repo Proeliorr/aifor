@@ -50,7 +50,15 @@ from plyfile import PlyData, PlyElement
 # The label remapping rule, shared with the class-unifier stage. It lives in its own
 # module so both stages can import it without a cycle (class_unifier imports the
 # cloud reader from here).
-from pipeline.classes import remap_and_filter
+from pipeline.classes import remap_and_filter, zero_stuff_tree_ids
+from pipeline.parallel import (
+    DEFAULT_BYTES_PER_POINT,
+    DEFAULT_MEMORY_BUDGET_FRAC,
+    Job,
+    estimate_points,
+    replay,
+    run_jobs,
+)
 
 log = logging.getLogger(__name__)
 
@@ -323,6 +331,28 @@ def _collect_inputs(root: Path, patterns: List[str]) -> List[Path]:
     return sorted(found)
 
 
+def _dispatch(jobs, succeeded, failed, workers, memory_budget_frac,
+              bytes_per_point, continue_on_error) -> None:
+    """Run the collected jobs in parallel and fold the outcome into the tallies.
+
+    Both modes end the same way, so the scheduling call lives here rather than
+    being written out twice. Worker log lines are replayed into this process so
+    they still reach Hydra's log file.
+    """
+    for result in run_jobs(jobs, workers=workers,
+                           memory_budget_frac=memory_budget_frac,
+                           bytes_per_point=bytes_per_point,
+                           continue_on_error=continue_on_error):
+        replay(result, log)
+        if result.ok:
+            succeeded.append(result.name)
+        else:
+            log.error("[%s] FAILED\n%s", result.name, result.error or "")
+            failed.append(result.name)
+    succeeded.sort()
+    failed.sort()
+
+
 def _preprocess_one(
     src_path: Path,
     plot: str,
@@ -332,6 +362,7 @@ def _preprocess_one(
     intensity_field: Optional[str] = None,
     class_map: Optional[Dict[int, int]] = None,
     drop_value: Optional[int] = None,
+    instance_classes: Optional[List[int]] = None,
 ) -> int:
     """Center one cloud, write ``<plot>.ply`` + ``<plot>_offsets.yml``.
 
@@ -355,6 +386,14 @@ def _preprocess_one(
     if n_points == 0:
         raise ValueError(
             f"[{plot}] every point was dropped by the class map — nothing to write")
+
+    # 3DFin gives EVERY point the nearest stem's id, ground included; ForAINet needs
+    # id 0 on everything that is not part of a tree, or it discards those instances
+    # wholesale. See pipeline/classes.py for the full story.
+    tree_id, n_zeroed = zero_stuff_tree_ids(tree_id, labels, instance_classes, plot)
+    if n_zeroed:
+        log.info("[%s] cleared the tree id of %s non-tree point(s) (classes outside %s)",
+                 plot, f"{n_zeroed:,}", list(instance_classes))
 
     # The shifts are the per-axis minima: subtracting them guarantees every
     # coordinate is >= 0 (ForAINet's requirement), with 0 at the plot corner.
@@ -393,6 +432,9 @@ def _preprocess_one(
         # Stage 1 input it came from.
         "n_points_source": int(len(keep)),
         "n_points_dropped": int(n_dropped),
+        # How many points had their 3DFin tree id cleared because they are not part
+        # of a tree (ground, undergrowth). 0 means the step was disabled.
+        "n_tree_ids_zeroed": int(n_zeroed),
         **meta,
     }
     offsets_path = out_dir / f"{plot}_offsets.yml"
@@ -477,6 +519,7 @@ def prep_forainet(
     intensity_field: Optional[str] = None,
     class_map: Optional[Dict[int, int]] = None,
     drop_value: Optional[int] = None,
+    instance_classes: Optional[List[int]] = None,
     restore_dir: Optional[str] = None,
     offsets_dir: Optional[str] = None,
     restore_format: str = "laz",
@@ -484,6 +527,9 @@ def prep_forainet(
     overwrite: bool = True,
     dry_run: bool = False,
     continue_on_error: bool = True,
+    workers: Optional[int] = None,
+    memory_budget_frac: float = DEFAULT_MEMORY_BUDGET_FRAC,
+    bytes_per_point: int = DEFAULT_BYTES_PER_POINT,
 ) -> None:
     """Center plot clouds for ForAINet, or restore its results to original coordinates.
 
@@ -520,6 +566,12 @@ def prep_forainet(
         centering, so the offsets file describes exactly the points in the PLY.
         Both come from the shared ``classes:`` block of ``conf/config.yaml``, which
         the class-unifier stage reads too. ``None`` = copy the labels unchanged.
+    instance_classes:
+        (preprocess) The unified classes made of individual trees. Every point
+        outside them gets tree id 0 = "not part of any tree", the convention
+        ForAINet's instance grouping depends on — 3DFin instead gives the ground
+        the nearest stem's id, which makes ForAINet discard the instances entirely.
+        ``None`` passes the ids through untouched.
     restore_dir:
         (restore) Folder of classified ``*.ply`` files to restore. **Required** in
         restore mode. Files already named ``restored_*`` are ignored.
@@ -540,12 +592,20 @@ def prep_forainet(
     continue_on_error:
         If ``True`` (default), keep going after a plot fails; otherwise stop at the
         first error.
+    workers, memory_budget_frac, bytes_per_point:
+        Parallelism — plots are independent, so several run at once, bounded by RAM
+        rather than cores (the biggest cloud here needs ~16 GB on its own).
+        ``workers=None`` lets the memory budget decide, capped by the CPU count; an
+        integer caps concurrency; ``workers=1`` runs everything inline exactly as
+        before. See ``pipeline/parallel.py``.
     """
     if mode not in ("preprocess", "restore"):
         raise ValueError(f"mode must be 'preprocess' or 'restore', got {mode!r}")
 
     # OmegaConf hands dict keys over as strings; the label columns are integers.
     class_map = {int(k): int(v) for k, v in (class_map or {}).items()}
+    instance_classes = ([int(c) for c in instance_classes]
+                        if instance_classes is not None else None)
     if mode == "preprocess" and class_map:
         log.info("Applying class map (%d source class(es) -> %s)%s",
                  len(class_map), sorted({int(v) for v in class_map.values()}),
@@ -576,6 +636,9 @@ def prep_forainet(
             return
         log.info("Found %d cloud(s) matching %s in %s", len(src_files), patterns, root)
 
+        # Skips, duplicates and dry runs are settled here in the parent -- they do
+        # no work, so there is nothing to parallelise and the log keeps plot order.
+        jobs: List[Job] = []
         seen: Dict[str, Path] = {}
         for src_path in src_files:
             plot = _plot_name(src_path)
@@ -598,17 +661,17 @@ def prep_forainet(
                 continue
 
             out_dir.mkdir(parents=True, exist_ok=True)
-            try:
-                _preprocess_one(src_path, plot, out_dir,
-                                semantic_field, tree_id_field, intensity_field,
-                                class_map, drop_value)
-                succeeded.append(plot)
-            except Exception:
-                log.exception("[%s] FAILED", plot)
-                failed.append(plot)
-                if not continue_on_error:
-                    log.error("continue_on_error=False — stopping after first failure.")
-                    break
+            jobs.append(Job(
+                name=plot,
+                fn=_preprocess_one,
+                args=(src_path, plot, out_dir,
+                      semantic_field, tree_id_field, intensity_field,
+                      class_map, drop_value, instance_classes),
+                n_points=estimate_points(src_path),   # header-only; sizes its RAM share
+            ))
+
+        _dispatch(jobs, succeeded, failed, workers,
+                  memory_budget_frac, bytes_per_point, continue_on_error)
 
     else:  # mode == "restore"
         if not restore_dir:
@@ -630,6 +693,7 @@ def prep_forainet(
         log.info("Found %d PLY file(s) to restore in %s (offsets from %s)",
                  len(ply_files), rdir, off_dir)
 
+        jobs: List[Job] = []
         for ply_path in ply_files:
             plot = _restore_plot_name(ply_path)
             offsets_path = off_dir / f"{plot}_offsets.yml"
@@ -649,17 +713,28 @@ def prep_forainet(
                 succeeded.append(plot)
                 continue
 
+            # The offsets file is small and read here, so a worker only ever
+            # receives plain picklable data.
             try:
                 with offsets_path.open() as fh:
                     offsets = yaml.safe_load(fh)
-                _restore_one(ply_path, plot, offsets, out_path)
-                succeeded.append(plot)
             except Exception:
-                log.exception("[%s] FAILED", plot)
+                log.exception("[%s] FAILED reading %s", plot, offsets_path.name)
                 failed.append(plot)
                 if not continue_on_error:
                     log.error("continue_on_error=False — stopping after first failure.")
                     break
+                continue
+
+            jobs.append(Job(
+                name=plot,
+                fn=_restore_one,
+                args=(ply_path, plot, offsets, out_path),
+                n_points=int(offsets.get("n_points") or estimate_points(ply_path)),
+            ))
+
+        _dispatch(jobs, succeeded, failed, workers,
+                  memory_budget_frac, bytes_per_point, continue_on_error)
 
     # --- summary -----------------------------------------------------------
     log.info("=" * 60)

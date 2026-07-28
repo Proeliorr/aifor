@@ -36,8 +36,24 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from pathlib import Path
 from typing import List, Optional
+
+# This tool owns its config (misc/conf/config.yaml) but shares the pipeline's
+# parallel scheduler rather than carrying a second copy of it. Python puts THIS
+# file's folder on sys.path, not the repo root, so point at the parent explicitly
+# — and do it before the import below.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from pipeline.parallel import (  # noqa: E402  (needs the sys.path line above)
+    DEFAULT_BYTES_PER_POINT,
+    DEFAULT_MEMORY_BUDGET_FRAC,
+    Job,
+    estimate_points,
+    replay,
+    run_jobs,
+)
 
 import hydra
 import laspy
@@ -131,6 +147,9 @@ def split_trees(
     overwrite: bool = True,
     dry_run: bool = False,
     continue_on_error: bool = True,
+    workers: Optional[int] = None,
+    memory_budget_frac: float = DEFAULT_MEMORY_BUDGET_FRAC,
+    bytes_per_point: int = DEFAULT_BYTES_PER_POINT,
 ) -> None:
     """Split every plot cloud under ``input_dir`` into per-tree ``.npy`` files.
 
@@ -188,6 +207,9 @@ def split_trees(
     failed: List[str] = []
     skipped: List[str] = []
 
+    # Skips and dry runs are settled here in the parent: no work, nothing to
+    # parallelise, and the log keeps plot order.
+    jobs: List[Job] = []
     for plot_dir in plot_dirs:
         matches = sorted(plot_dir.glob(pattern))
         if not matches:
@@ -212,15 +234,26 @@ def split_trees(
             succeeded.append(plot)
             continue
 
-        try:
-            _split_one_plot(las_path, plot, columns, digits)
-            succeeded.append(plot)
-        except Exception:
-            log.exception("[%s] FAILED", plot)
-            failed.append(plot)
-            if not continue_on_error:
-                log.error("continue_on_error=False — stopping after first failure.")
-                break
+        jobs.append(Job(
+            name=plot,
+            fn=_split_one_plot,
+            args=(las_path, plot, columns, digits),
+            n_points=estimate_points(las_path),   # header-only; sizes its RAM share
+        ))
+
+    # Plots are independent; how many run at once is decided by memory, not cores.
+    for result in run_jobs(jobs, workers=workers,
+                           memory_budget_frac=memory_budget_frac,
+                           bytes_per_point=bytes_per_point,
+                           continue_on_error=continue_on_error):
+        replay(result, log)
+        if result.ok:
+            succeeded.append(result.name)
+        else:
+            log.error("[%s] FAILED\n%s", result.name, result.error or "")
+            failed.append(result.name)
+    succeeded.sort()
+    failed.sort()
 
     # --- summary -----------------------------------------------------------
     log.info("=" * 60)

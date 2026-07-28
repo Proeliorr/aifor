@@ -19,13 +19,13 @@
   ],
   "output_format": "ply",
   "files": [
-    "plot_10.ply"
+    "plot_09.ply"
   ],
-  "source_file": "plot_10_tree_ID_dist_axes.las",
+  "source_file": "plot_09_tree_ID_dist_axes.las",
   "source_format": "las",
   "crs_wkt": null,
-  "num_points": 42511997,
-  "num_points_source": 42511997,
+  "num_points": 72578906,
+  "num_points_source": 72578906,
   "semantic_field": "Class",
   "unified_field": "semantic_seg",
   "class_map": {
@@ -57,23 +57,17 @@
     "4": "live_branches"
   },
   "class_counts_before": {
-    "0": 5357902,
-    "1": 4070511,
-    "2": 13393023,
-    "3": 9550410,
-    "4": 81767,
-    "5": 125344,
-    "11": 269800,
-    "12": 7136547,
-    "13": 1176987,
-    "22": 1259529,
-    "23": 90177
+    "0": 119310,
+    "1": 26643514,
+    "2": 24884420,
+    "3": 19371025,
+    "4": 1491999,
+    "5": 68638
   },
   "class_counts_after": {
-    "0": 269800,
-    "1": 15228253,
-    "2": 4070511,
-    "3": 9550410,
-    "4": 13393023
+    "1": 1679947,
+    "2": 26643514,
+    "3": 19371025,
+    "4": 24884420
   }
 }

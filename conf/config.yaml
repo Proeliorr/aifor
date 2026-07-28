@@ -5,9 +5,10 @@
 # ============================================================================
 # Semantic class scheme — SegmentedForests labels -> ForAINet labels
 #
-# Defined ONCE here and interpolated by both stages that touch labels
-# (`class_unifier:` and `forainet_prep:`), so the .npy exports and the PLYs
-# ForAINet actually trains on can never disagree.
+# NOT A STAGE: nothing runs this on its own, there is no engine behind it. It is
+# plain config, interpolated by both stages that touch labels
+# (`class_unifier:` and `forainet_prep:`), so the diagnostic exports and the PLYs
+# ForAINet actually trains on can never disagree about what a class number means.
 #
 # Nothing about this block is ForAINet-specific machinery — it is plain config.
 # Pointing the pipeline at another dataset means a different `class_map` and
@@ -25,6 +26,7 @@
 # In short: change the scheme by editing this file. Reserve the CLI for one-off
 # experiments, and never for a run whose output feeds training.
 # ============================================================================
+
 classes:
   # Source column holding the ground-truth label, and the tree/instance id.
   # Stated explicitly rather than left to auto-detection: picking the wrong
@@ -34,8 +36,20 @@ classes:
   # Name of the NEW column receiving the remapped labels.
   unified_field: semantic_seg
 
-  # Points whose mapped label equals `drop_value` are REMOVED from the output
-  # (they have no ForAINet counterpart). null = keep everything.
+  # Points whose mapped label equals `drop_value` are physically removed from the
+  # output; `null` keeps every point.
+  #
+  # Currently INERT: nothing in the map below targets -1, so nothing is dropped.
+  # That is deliberate. The classes with no ForAINet counterpart (8, 9, 11) are
+  # sent to 0 = "unclassified" instead, and ForAINet's reader subtracts one
+  # (`semantic_seg - 1`, see datasets/segmentation/treeins_set1.py), turning 0
+  # into -1 = IGNORE_LABEL. Its losses pass that as `ignore_index`, so those
+  # points contribute no loss and no gradient but STAY in the cloud -- their
+  # geometry still supports the neighbourhood features of the points around them.
+  # Deleting them instead would punch holes in the cloud and change what every
+  # nearby point sees.
+  #
+  # Kept as a safety valve: map a class to -1 here if you ever do want it gone.
   drop_value: -1
 
   # {SegmentedForests Class: ForAINet semantic_seg}. Several sources sharing a
@@ -43,38 +57,57 @@ classes:
   # union of `Class` over the dataset is exactly the 16 keys below.
   class_map:
     # no ForAINet counterpart -> dropped
-    8: -1
-    9: -1
-    11: -1
-    # -> 0 low_vegetation
-    0: 0
-    4: 0
-    5: 0
-    6: 0
-    7: 0
-    12: 0
-    13: 0
-    22: 0
-    23: 0
-    # -> 1 ground
-    1: 1
-    # -> 2 stem_points
-    3: 2
-    10: 2
-    # -> 3 live_branches
-    2: 3
+    8: 0
+    9: 0
+    11: 0
+    # -> 1 low_vegetation
+    0: 1
+    4: 1
+    5: 1
+    6: 1
+    7: 1
+    12: 1
+    13: 1
+    22: 1
+    23: 1
+    # -> 2 ground
+    1: 2
+    # -> 3 stem_points
+    3: 3
+    10: 3
+    # -> 4 live_branches
+    2: 4
 
   # The unified scheme, echoed into every sidecar. ForAINet's class 4
   # ("branches") is absent: SegmentedForests has no corresponding label, so it
   # was removed from the framework too (see patches/forainet-local.patch).
   class_names:
-    0: low_vegetation
-    1: ground
-    2: stem_points
-    3: live_branches
+    0: unclassified      # ForAINet maps this to -1 and ignores it
+    1: low_vegetation
+    2: ground
+    3: stem_points
+    4: live_branches
+
+  # Which of the classes above are made of INDIVIDUAL TREES ("thing" classes).
+  # Values use the same numbering as `class_names` right above.
+  #
+  # Everything else is "stuff" (ground, undergrowth) and must carry tree id 0,
+  # meaning "not part of any tree" -- that is the convention ForAINet's own files
+  # follow, where low_vegetation/ground are id 0 for 100% of their points.
+  #
+  # 3DFin does NOT follow it: it gives every point the id of the nearest stem, so
+  # the ground and undergrowth beneath a tree inherit that tree's id (one measured
+  # example: id 114189 covered 3.0M points, of which 1.6M were ground and low
+  # vegetation). ForAINet's set_extra_labels() then skips any instance whose id
+  # also appears on a stuff point -- which, with 3DFin ids, is every single one:
+  # 0 of 42 tree instances survived on plot_10.
+  #
+  # So Stage 2 zeroes the tree id outside these classes. `null` disables that and
+  # passes the ids through untouched.
+  instance_classes: [3, 4]     # stem_points, live_branches
 
 # ============================================================================
-# Stage 1 — 3DFin instance segmentation
+# Stage 1 — 3DFin instance segmentation (adds tree_ID per point). This data will be used for training the instance segmentation head.
 #   run with: python main_pipeline.py   (engine: pipeline/threedfin.py)
 # ============================================================================
 threedfin:
@@ -102,7 +135,10 @@ threedfin:
   continue_on_error: true
 
 # ============================================================================
-# Class unifier — remap semantic labels into a new column, export .npy + .json
+# Class unifier (optional, diagnostic) — apply the `classes:` scheme and export a
+# cloud to LOOK AT in misc/view_split_point_cloud.ipynb. Nothing downstream reads
+# its output: the labels ForAINet trains on are written by Stage 2 below, from the
+# same shared map.
 #   run with: python class_unifier.py   (engine: pipeline/class_unifier.py)
 # ============================================================================
 class_unifier:
@@ -150,6 +186,18 @@ class_unifier:
   dry_run: false
   continue_on_error: true
 
+  # --- Parallelism (see pipeline/parallel.py) ---
+  # Plots are independent, so several are processed at once. The limit is RAM, not
+  # cores: these clouds run from 19M to 280M points and cost ~140 bytes/point
+  # (measured), so the biggest needs ~39 GB on its own and a worker per core would
+  # exhaust the machine. Each plot's size is read from its LAS header (instant) and
+  # work is admitted only while it still fits the budget — so a huge plot runs
+  # nearly alone while small ones pack several deep.
+  workers: null             # null = as many as the budget allows (capped by CPU count);
+                            # an int caps concurrency; 1 = inline, exactly as before
+  memory_budget_frac: 0.7   # of total RAM; the rest is headroom for the OS
+  bytes_per_point: 140      # MEASURED peak RSS per point (plot_09: 72.6M pts -> 9.1 GB)
+
 # ============================================================================
 # Stage 2 — prepare plots for ForAINet (center coordinates + PLY) / restore results
 #   run with: python forainet_prep.py   (engine: pipeline/forainet_prep.py)
@@ -188,6 +236,9 @@ forainet_prep:
   # statistics in <plot>_offsets.yml describe exactly the points in the PLY.
   class_map: ${classes.class_map}
   drop_value: ${classes.drop_value}
+  # Points outside these classes get tree id 0 ("not part of any tree"), which is
+  # what ForAINet's instance grouping requires -- see the note in `classes:`.
+  instance_classes: ${classes.instance_classes}
 
   # --- restore mode ---
   restore_dir: null         # folder of classified *.ply to restore (required for mode=restore)
@@ -202,3 +253,9 @@ forainet_prep:
   overwrite: true           # false = skip plots whose output file already exists
   dry_run: false
   continue_on_error: true
+
+  # --- Parallelism (same semantics as class_unifier above; pipeline/parallel.py) ---
+  # Applies to BOTH modes: preprocess and restore.
+  workers: null             # null = memory-budgeted; int caps it; 1 = inline as before
+  memory_budget_frac: 0.7
+  bytes_per_point: 140      # MEASURED: plot_09, 72.6M pts -> 9.1 GB peak

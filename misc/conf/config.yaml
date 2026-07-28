@@ -24,3 +24,13 @@ tree_splitter:
   overwrite: true           # false = skip plots whose <plot>_001.npy already exists
   dry_run: false
   continue_on_error: true
+
+  # --- Parallelism (shared scheduler: pipeline/parallel.py) ---
+  # Plots are independent, so several are split at once. The ceiling is RAM rather
+  # than cores — these clouds reach 280M points at ~140 bytes/point, so the biggest
+  # needs ~39 GB by itself. Sizes come from the LAS headers (instant), and work is
+  # admitted only while it still fits the budget.
+  workers: null             # null = memory-budgeted (capped by CPU count);
+                            # an int caps concurrency; 1 = inline, exactly as before
+  memory_budget_frac: 0.7   # of total RAM
+  bytes_per_point: 140      # MEASURED: plot_09, 72.6M pts -> 9.1 GB peak

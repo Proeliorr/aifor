@@ -25,7 +25,7 @@ Two rules worth knowing:
 """
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -91,6 +91,42 @@ def to_label_dtype(unified: np.ndarray) -> np.ndarray:
     if unified.size and unified.min() >= 0 and unified.max() <= 255:
         return unified.astype(np.uint8)
     return unified
+
+
+def zero_stuff_tree_ids(
+    tree_id: np.ndarray,
+    labels: np.ndarray,
+    instance_classes: Optional[Sequence[int]],
+    plot: str = "?",
+) -> Tuple[np.ndarray, int]:
+    """Zero the instance id of every point outside ``instance_classes``.
+
+    ForAINet's convention is that tree id 0 means "not part of any tree", and its
+    own training files follow it exactly: ground and low vegetation are id 0 for
+    100% of their points, only stems and branches carry real ids.
+
+    3DFin does not. It labels every point with the nearest stem's id, so the
+    ground and undergrowth under a tree inherit that tree's id. That breaks
+    instance segmentation outright, because ``set_extra_labels`` skips any
+    instance whose id also shows up on a non-thing point -- with 3DFin ids that
+    is every instance, leaving nothing to learn from.
+
+    ``labels`` are the already-remapped (unified) labels, so ``instance_classes``
+    is expressed in the unified scheme -- the same numbers as ``class_names`` in
+    ``conf/config.yaml``, not the source dataset's.
+
+    ``instance_classes=None`` passes the ids through untouched. Returns
+    ``(tree_id, n_zeroed)``; the input array is never modified in place.
+    """
+    if instance_classes is None:
+        return tree_id, 0
+
+    labels = np.asarray(labels)
+    is_thing = np.isin(labels, [int(c) for c in instance_classes])
+    # Only count points that actually lose an id, so the log means something.
+    zeroed = int((~is_thing & (np.asarray(tree_id) != 0)).sum())
+    out = np.where(is_thing, tree_id, 0).astype(tree_id.dtype, copy=False)
+    return out, zeroed
 
 
 def remap_and_filter(

@@ -267,6 +267,64 @@ Dates follow the Hydra run logs in `outputs/<date>/<time>/`.
   (`[125.88 128.06 127.14]` → moved → identical again); `r` confirmed bound via
   `clear_events_for_key(raise_on_missing=True)`; placement eyeballed on a screenshot.
 
+## 2026-07-29 — Stage 2: tree ids cleared on non-tree points (instances were all being lost)
+
+- **The defect.** ForAINet's convention is `treeID = 0` for anything that is not part
+  of a tree; its own files follow it exactly (ground and low_vegetation are id 0 for
+  100% of their points). 3DFin does not — it stamps every point with the *nearest
+  stem's* id, so ground and undergrowth inherit the tree above them. One measured
+  example on plot_10: id `114189` covered 3,046,870 points, of which 1,073,013 were
+  low_vegetation and 585,295 ground.
+- **Why that is fatal.** `set_extra_labels()` skips any instance whose id also appears
+  on a non-thing point — a rule meant to discard the single "not a tree" bucket (id 0).
+  With 3DFin ids every id looks contaminated, so **0 of 42 tree instances survived** on
+  plot_10. Training would have run normally and learned instance segmentation from
+  nothing.
+- **The fix.** New `classes.instance_classes` (`[3, 4]` = stem_points, live_branches, in
+  the same numbering as `class_names`); Stage 2 zeroes the tree id of every point
+  outside those classes, via `zero_stuff_tree_ids()` in `pipeline/classes.py`.
+  `null` disables it. `<plot>_offsets.yml` records `n_tree_ids_zeroed`.
+- Verified on plot_10 against `NIBIO2_plot12_annotated_train.ply` as the reference,
+  simulating ForAINet's own read (`semantic_seg - 1`, `treeID + 1`) and its instance
+  filter: stuff classes now 100% id 0, thing classes untouched, and **42 of 42
+  instances survive** (was 0 of 42). 19,568,564 ids cleared.
+- Note the reference file itself reports 35 of 48 under our *4-class* thing set, because
+  upstream's `branches` becomes "stuff" and takes its ids with it. That is an artifact of
+  scoring 5-class data with the patched framework, not a defect in the original.
+
+## 2026-07-29 — Parallel plot processing, bounded by memory rather than cores
+
+- **`pipeline/parallel.py`** (new): plots are independent, so several now run at once in
+  worker **processes** (the work is numpy + LAZ decompression, so threads would serialise
+  on the GIL). Used by `class_unifier`, `forainet_prep` (both modes) and
+  `misc/tree_splitter.py`. **Stage 1 (3DFin) stays sequential** — it only waits on an
+  external binary whose own threading is unknown.
+- **Cores are not the limit, RAM is.** The clouds span 19 M to 280 M points, and Stage 2
+  costs a **measured ~134 bytes/point** (plot_09: 72.6 M pts → 9.1 GB peak), so plot_08
+  alone needs ~37 GB. A worker per core would exhaust the machine. The scheduler reads
+  each plot's point count from the LAS header (instant), sorts biggest-first, and admits
+  work only while it still fits a budget (70% of RAM) — so a huge plot runs nearly alone
+  while small ones pack several deep. A plot larger than the whole budget still runs, on
+  its own, rather than deadlocking.
+- Worker log lines are captured and replayed by the parent, so
+  `outputs/<date>/<time>/*.log` keeps the same per-plot detail. Workers also get
+  `OMP_NUM_THREADS=1` etc., or each would start its own BLAS pool and fight for cores.
+- `workers: 1` runs everything inline — byte-for-byte the old behaviour, and the escape
+  hatch if anything looks wrong.
+- **Verified**: outputs are byte-identical between sequential and parallel (sha256 over
+  `.ply` + `.json`); every per-plot log line survives the worker boundary; a failing plot
+  is isolated with its real error text intact and the summary still reports it.
+- **Measured on the full 14-plot Stage 2 run: 3.3 min → 2.4 min (~1.4×), peak RSS 39.4 GB
+  against a 44.7 GB budget, 14/14 ok.** The modest speedup is honest and expected:
+  plot_08 is 33% of all points and needs ~37 GB, so it runs essentially alone and sets the
+  floor (Amdahl). Raising `memory_budget_frac` above 0.7 buys a little more at the cost of
+  headroom.
+- Two things worth recording from the debugging, because both looked like code defects and
+  were not: an early "worker OOM" was actually **the system drive filling up** with my own
+  benchmark output (a 14-plot run is ~25 GB, and the default temp dir is on C:); and the
+  first `bytes_per_point` guess of 60 counted only the obvious arrays, missing that
+  `plyfile.write()` does `data.astype(...).tobytes()` — two more full copies.
+
 ---
 
 ## Planned

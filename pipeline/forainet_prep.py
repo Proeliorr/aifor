@@ -70,6 +70,12 @@ _INPUT_SUFFIX = "_tree_ID_dist_axes"
 # recovering the plot name in restore mode (dummy_plot_01.ply -> plot_01).
 _RESTORE_PREFIXES = ("restored_", "dummy_")
 
+# ForAINet reads the split from the FILE NAME -- there is no manifest. Its reader
+# tests `name[-7:-4] == "val"` then `name[-8:-4] == "test"`, anything else being
+# training data (datasets/segmentation/treeins_set1.py). These are the suffixes the
+# reference dataset uses, so they are what we write.
+_SPLITS = ("train", "val", "test")
+
 # Vertex layout ForAINet expects (see ForAINet's treeins datasets): coordinates and
 # intensity as float64, the semantic label as uint8, the instance id as uint32.
 _FORAINET_DTYPE = [
@@ -363,8 +369,15 @@ def _preprocess_one(
     class_map: Optional[Dict[int, int]] = None,
     drop_value: Optional[int] = None,
     instance_classes: Optional[List[int]] = None,
+    split: Optional[str] = None,
+    offsets_dir: Optional[Path] = None,
 ) -> int:
-    """Center one cloud, write ``<plot>.ply`` + ``<plot>_offsets.yml``.
+    """Center one cloud, write ``<stem>.ply`` + ``<plot>_offsets.yml``.
+
+    ``split`` (``train``/``val``/``test``, or ``None``) only decides the PLY's file
+    name, because that is the sole way ForAINet learns which set a cloud belongs to.
+    The offsets file keeps the plain plot name: it describes geometry, not a split,
+    and restore looks it up by plot.
 
     Returns the point count actually written (after any class-based dropping).
     """
@@ -409,7 +422,7 @@ def _preprocess_one(
     array["semantic_seg"] = labels
     array["treeID"] = tree_id.astype(np.uint32)
 
-    ply_path = out_dir / f"{plot}.ply"
+    ply_path = out_dir / (f"{plot}_{split}.ply" if split else f"{plot}.ply")
     _write_ply(array, ply_path)
 
     # The shifts plus statistics for validating a later restoration, and the source
@@ -435,9 +448,19 @@ def _preprocess_one(
         # How many points had their 3DFin tree id cleared because they are not part
         # of a tree (ground, undergrowth). 0 means the step was disabled.
         "n_tree_ids_zeroed": int(n_zeroed),
+        # Which set this plot was assigned to, and under what name it was written.
+        # The suffix IS the split as far as ForAINet is concerned, so recording it
+        # here makes the assignment auditable after the fact.
+        "split": split,
+        "ply_file": ply_path.name,
         **meta,
     }
-    offsets_path = out_dir / f"{plot}_offsets.yml"
+    # The offsets can live apart from the cloud: the PLYs go into ForAINet's data
+    # folder, but this metadata belongs to us -- it is tracked, and without it a
+    # restore is impossible.
+    off_dir = Path(offsets_dir) if offsets_dir else out_dir
+    off_dir.mkdir(parents=True, exist_ok=True)
+    offsets_path = off_dir / f"{plot}_offsets.yml"
     with offsets_path.open("w") as fh:
         yaml.dump(offsets, fh, default_flow_style=False, sort_keys=False)
 
@@ -454,12 +477,65 @@ def _preprocess_one(
 # ---------------------------------------------------------------------------
 
 def _restore_plot_name(ply_path: Path) -> str:
-    """Recover the plot name from a classified PLY's stem, stripping known prefixes."""
+    """Recover the plot name from a classified PLY's stem.
+
+    Strips both the prefixes a classifier may add (``restored_``, ``dummy_``) and the
+    split suffix this stage appends (``_train``/``_val``/``_test``), because the
+    offsets file is keyed by the PLAIN plot name -- ``plot_11_val.ply`` must still
+    find ``plot_11_offsets.yml``.
+    """
     stem = ply_path.stem
     for prefix in _RESTORE_PREFIXES:
         if stem.startswith(prefix):
             stem = stem[len(prefix):]
+    for split in _SPLITS:
+        if stem.endswith(f"_{split}"):
+            stem = stem[: -len(split) - 1]
+            break
     return stem
+
+
+def assign_splits(counts: Dict[str, int], n_val=0, n_test=0) -> Dict[str, str]:
+    """Decide which plots are ``train`` / ``val`` / ``test``.
+
+    ForAINet reads the split from the FILE NAME, so this has to be settled before
+    anything is written. Plots are ranked by point count **descending** and the
+    SMALLEST are held out, which keeps the bulk of the points for training.
+
+    ``n_val`` / ``n_test`` are each either an exact count (``int``) or a fraction of
+    the plots (``float`` below 1, rounded, but at least 1 when non-zero) -- so the
+    same setting fits a 14-plot and a 50-plot dataset.
+
+    Ties are broken by plot name so that two equally sized plots never swap roles
+    between runs.
+    """
+    def resolve(value, total: int) -> int:
+        if not value:
+            return 0
+        if isinstance(value, float) and 0 < value < 1:
+            return max(1, int(round(value * total)))
+        return int(value)
+
+    total = len(counts)
+    n_v, n_t = resolve(n_val, total), resolve(n_test, total)
+    if n_v + n_t >= total:
+        raise ValueError(
+            f"split leaves no training plots: n_val={n_v} + n_test={n_t} of {total} "
+            f"plot(s). Lower them, or add more plots."
+        )
+
+    # Biggest first; the name is the tie-breaker, so the order is reproducible.
+    ordered = sorted(counts, key=lambda p: (-int(counts[p]), p))
+    out = {p: "train" for p in ordered}
+
+    held = ordered[len(ordered) - n_v - n_t:]      # the smallest n_v + n_t plots
+    # The very smallest validate; the ones just above them test. Note `held[-0:]`
+    # would be the whole list, hence the explicit n_v guard.
+    for p in (held[-n_v:] if n_v else []):
+        out[p] = "val"
+    for p in held[:n_t]:
+        out[p] = "test"
+    return out
 
 
 def _restore_one(ply_path: Path, plot: str, offsets: Dict, out_path: Path) -> int:
@@ -520,6 +596,8 @@ def prep_forainet(
     class_map: Optional[Dict[int, int]] = None,
     drop_value: Optional[int] = None,
     instance_classes: Optional[List[int]] = None,
+    split: Optional[Dict[str, object]] = None,
+    split_of: Optional[Dict[str, str]] = None,
     restore_dir: Optional[str] = None,
     offsets_dir: Optional[str] = None,
     restore_format: str = "laz",
@@ -530,7 +608,8 @@ def prep_forainet(
     workers: Optional[int] = None,
     memory_budget_frac: float = DEFAULT_MEMORY_BUDGET_FRAC,
     bytes_per_point: int = DEFAULT_BYTES_PER_POINT,
-) -> None:
+    log_summary: bool = True,
+) -> Dict[str, List[str]]:
     """Center plot clouds for ForAINet, or restore its results to original coordinates.
 
     Parameters
@@ -572,11 +651,28 @@ def prep_forainet(
         ForAINet's instance grouping depends on — 3DFin instead gives the ground
         the nearest stem's id, which makes ForAINet discard the instances entirely.
         ``None`` passes the ids through untouched.
+    split:
+        (preprocess) ``{"n_val": ..., "n_test": ...}`` — appends ``_train``/``_val``/
+        ``_test`` to each PLY's name, which is the ONLY way ForAINet learns what a
+        cloud is for. Plots are ranked by point count and the smallest held out; each
+        value is a count (int) or a fraction of the plots (float < 1). See
+        :func:`assign_splits`. ``None`` writes plain ``<plot>.ply`` as before.
+    split_of:
+        (preprocess) An **already decided** ``{plot: "train"|"val"|"test"}`` mapping,
+        used instead of computing one from ``split``. Not a config key — it exists for
+        the chained driver (``pipeline/chain.py``), which processes one plot at a time
+        and so cannot rank it against the others: it reads the point counts from the
+        *source* clouds up front (3DFin preserves them exactly) and passes the result
+        down. Without this a per-plot run would rank each plot against whatever output
+        happened to exist at that moment and hand out ``_val``/``_test`` at random.
     restore_dir:
         (restore) Folder of classified ``*.ply`` files to restore. **Required** in
         restore mode. Files already named ``restored_*`` are ignored.
     offsets_dir:
-        (restore) Where the ``<plot>_offsets.yml`` files live. ``None`` = ``output_dir``.
+        Where the ``<plot>_offsets.yml`` files live, in **both** modes; ``None`` =
+        beside the clouds. Preprocess writes them here and restore reads them from
+        here, which lets the PLYs go straight into ForAINet's data folder while this
+        metadata stays in the repo — tracked by git, and safe from a dataset wipe.
     restore_format:
         (restore) ``"laz"`` (default) = compressed LAS 1.4 with the source scales and
         CRS re-applied and all extra fields (labels, predictions) kept as extra-bytes
@@ -598,6 +694,19 @@ def prep_forainet(
         ``workers=None`` lets the memory budget decide, capped by the CPU count; an
         integer caps concurrency; ``workers=1`` runs everything inline exactly as
         before. See ``pipeline/parallel.py``.
+    log_summary:
+        If ``False``, drop the run-level framing (the class-map and "found N clouds"
+        lines, and the closing ``=`` rule and tallies) and log only the per-plot work.
+        The chained driver calls this once per plot, so the framing would otherwise
+        repeat for every one of them and bury the actual output.
+
+    Returns
+    -------
+    dict
+        ``{"succeeded": [...], "failed": [...], "skipped": [...]}`` — the plot names
+        behind the summary line. The chained driver needs this to decide whether a
+        plot's 3DFin ``.las`` may be deleted; ``zen()`` discards it when this runs as a
+        standalone stage.
     """
     if mode not in ("preprocess", "restore"):
         raise ValueError(f"mode must be 'preprocess' or 'restore', got {mode!r}")
@@ -606,7 +715,7 @@ def prep_forainet(
     class_map = {int(k): int(v) for k, v in (class_map or {}).items()}
     instance_classes = ([int(c) for c in instance_classes]
                         if instance_classes is not None else None)
-    if mode == "preprocess" and class_map:
+    if mode == "preprocess" and class_map and log_summary:
         log.info("Applying class map (%d source class(es) -> %s)%s",
                  len(class_map), sorted({int(v) for v in class_map.values()}),
                  "" if drop_value is None else
@@ -617,6 +726,10 @@ def prep_forainet(
     failed: List[str] = []
     skipped: List[str] = []
 
+    def tally() -> Dict[str, List[str]]:
+        """The outcome, for a caller that has to act on it (see the Returns section)."""
+        return {"succeeded": succeeded, "failed": failed, "skipped": skipped}
+
     if mode == "preprocess":
         root = Path(input_dir)
         if not root.is_dir():
@@ -625,16 +738,46 @@ def prep_forainet(
         patterns = list(patterns) if patterns else ["*.las", "*.laz", "*.ply"]
 
         src_files = _collect_inputs(root, patterns)
+        if not src_files:
+            log.warning("No clouds matching %s in %s (flat or per-plot) — nothing to do.",
+                        patterns, root)
+            return tally()
+        if log_summary:
+            log.info("Found %d cloud(s) matching %s in %s", len(src_files), patterns, root)
+
+        # Work out the train/val/test assignment across EVERY matched cloud, before
+        # the `plots` filter narrows things down. Otherwise `plots=[plot_01]` would
+        # make plot_01 "the smallest" and mark it validation -- a subset run must give
+        # a plot the same suffix a full run would. Point counts come from the LAS
+        # headers, which the memory scheduler reads anyway.
+        #
+        # ...unless the caller already decided (`split_of`): the chained driver ranks
+        # the SOURCE clouds up front, because it feeds this function one plot at a
+        # time and the ranking cannot be recovered from a single file.
+        if split_of:
+            split_of = {str(k): str(v) for k, v in split_of.items()}
+            if log_summary:
+                log.info("Split supplied by the caller for %d plot(s)", len(split_of))
+        elif split:
+            counts = {_plot_name(p): estimate_points(p) for p in src_files}
+            split_of = assign_splits(counts, split.get("n_val", 0), split.get("n_test", 0))
+            by_split: Dict[str, List[str]] = {}
+            for plot_name, which in sorted(split_of.items()):
+                by_split.setdefault(which, []).append(plot_name)
+            log.info("Split over all %d plot(s) by point count (smallest held out): %s",
+                     len(counts), "; ".join(f"{k}={len(v)} {v}" for k, v in
+                                            sorted(by_split.items())))
+        else:
+            split_of = {}
+
         if wanted is not None:
             selected = [p for p in src_files if _plot_name(p) in wanted]
             for name in sorted(wanted - {_plot_name(p) for p in selected}):
                 log.warning("Requested plot %r matched no file in %s", name, root)
             src_files = selected
-        if not src_files:
-            log.warning("No clouds matching %s in %s (flat or per-plot) — nothing to do.",
-                        patterns, root)
-            return
-        log.info("Found %d cloud(s) matching %s in %s", len(src_files), patterns, root)
+            if not src_files:
+                log.warning("No requested plot matched — nothing to do.")
+                return tally()
 
         # Skips, duplicates and dry runs are settled here in the parent -- they do
         # no work, so there is nothing to parallelise and the log keeps plot order.
@@ -649,7 +792,8 @@ def prep_forainet(
                 continue
             seen[plot] = src_path
 
-            out_ply = out_dir / f"{plot}.ply"
+            which = split_of.get(plot)
+            out_ply = out_dir / (f"{plot}_{which}.ply" if which else f"{plot}.ply")
             if not overwrite and out_ply.exists():
                 log.info("[%s] %s already exists and overwrite=False — skipping", plot, out_ply.name)
                 skipped.append(plot)
@@ -661,12 +805,26 @@ def prep_forainet(
                 continue
 
             out_dir.mkdir(parents=True, exist_ok=True)
+
+            # A plot can change split (a new plot shifts the ranking, or n_test
+            # changes), leaving the previous file behind. ForAINet globs
+            # raw/**/*.ply, so it would load this plot TWICE, in two different
+            # splits -- training on its own test data without complaint.
+            for other in _SPLITS:
+                stale = out_dir / f"{plot}_{other}.ply"
+                if other != which and stale.exists():
+                    stale.unlink()
+                    log.warning("[%s] removed %s — this plot is now '%s', and leaving "
+                                "both would put it in two splits at once",
+                                plot, stale.name, which)
+
             jobs.append(Job(
                 name=plot,
                 fn=_preprocess_one,
                 args=(src_path, plot, out_dir,
                       semantic_field, tree_id_field, intensity_field,
-                      class_map, drop_value, instance_classes),
+                      class_map, drop_value, instance_classes, which,
+                      Path(offsets_dir) if offsets_dir else None),
                 n_points=estimate_points(src_path),   # header-only; sizes its RAM share
             ))
 
@@ -689,7 +847,7 @@ def prep_forainet(
             ply_files = [p for p in ply_files if _restore_plot_name(p) in wanted]
         if not ply_files:
             log.warning("No PLY files to restore in %s — nothing to do.", rdir)
-            return
+            return tally()
         log.info("Found %d PLY file(s) to restore in %s (offsets from %s)",
                  len(ply_files), rdir, off_dir)
 
@@ -737,14 +895,17 @@ def prep_forainet(
                   memory_budget_frac, bytes_per_point, continue_on_error)
 
     # --- summary -----------------------------------------------------------
-    log.info("=" * 60)
-    if dry_run:
-        log.info("DRY RUN (%s) — would process %d plot(s); %d skipped.",
-                 mode, len(succeeded), len(skipped))
-    else:
-        log.info("%s: processed %d plot(s): %d ok, %d failed, %d skipped.",
-                 mode, len(succeeded) + len(failed), len(succeeded), len(failed), len(skipped))
-        if failed:
-            log.warning("Failed: %s", ", ".join(failed))
-    if skipped:
-        log.warning("Skipped: %s", ", ".join(skipped))
+    if log_summary:
+        log.info("=" * 60)
+        if dry_run:
+            log.info("DRY RUN (%s) — would process %d plot(s); %d skipped.",
+                     mode, len(succeeded), len(skipped))
+        else:
+            log.info("%s: processed %d plot(s): %d ok, %d failed, %d skipped.",
+                     mode, len(succeeded) + len(failed), len(succeeded), len(failed), len(skipped))
+            if failed:
+                log.warning("Failed: %s", ", ".join(failed))
+        if skipped:
+            log.warning("Skipped: %s", ", ".join(skipped))
+
+    return tally()

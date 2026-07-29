@@ -32,7 +32,7 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
@@ -127,7 +127,8 @@ def run_pipeline(
     prune_outputs: bool = True,
     dry_run: bool = False,
     continue_on_error: bool = True,
-) -> None:
+    log_summary: bool = True,
+) -> Dict[str, List[str]]:
     """Run the 3DFin CLI for every point cloud matched in ``pointclouds_dir``.
 
     Each ``<stem>.laz`` is paired with ``<ini_dir>/<stem>.ini`` and its results are written to
@@ -159,6 +160,19 @@ def run_pipeline(
     continue_on_error:
         If ``True`` (default), keep going after a plot fails; otherwise stop at the first
         non-zero exit.
+    log_summary:
+        If ``False``, drop the run-level framing (the "found N clouds" line and the
+        closing ``=`` rule and tallies) and log only the per-plot work. The chained
+        driver calls this once per plot, so the framing would otherwise repeat for every
+        one of them and bury the actual output.
+
+    Returns
+    -------
+    dict
+        ``{"succeeded": [...], "failed": [...], "skipped": [...]}`` — the plot names
+        behind the summary line. The chained driver (``pipeline/chain.py``) needs this
+        to decide, per plot, whether it may hand the result on to Stage 2; ``zen()``
+        discards it when this runs as a standalone stage.
     """
     pc_dir = Path(pointclouds_dir)
     ini_path = Path(ini_dir)
@@ -191,9 +205,10 @@ def run_pipeline(
 
     if not laz_files:
         log.warning("No point clouds matched %r in %s — nothing to do.", pattern, pc_dir)
-        return
+        return {"succeeded": [], "failed": [], "skipped": []}
 
-    log.info("Found %d point cloud(s) to process in %s", len(laz_files), pc_dir)
+    if log_summary:
+        log.info("Found %d point cloud(s) to process in %s", len(laz_files), pc_dir)
 
     planned: List[str] = []
     succeeded: List[str] = []
@@ -260,14 +275,24 @@ def run_pipeline(
                 break
 
     # --- summary ---------------------------------------------------------
-    log.info("=" * 60)
-    if dry_run:
-        log.info("DRY RUN — would process %d plot(s); %d skipped (no .ini).",
-                 len(planned), len(skipped))
-    else:
-        log.info("Processed %d plot(s): %d ok, %d failed, %d skipped.",
-                 len(succeeded) + len(failed), len(succeeded), len(failed), len(skipped))
-        if failed:
-            log.warning("Failed: %s", ", ".join(failed))
-    if skipped:
-        log.warning("Skipped (no .ini): %s", ", ".join(skipped))
+    if log_summary:
+        log.info("=" * 60)
+        if dry_run:
+            log.info("DRY RUN — would process %d plot(s); %d skipped (no .ini).",
+                     len(planned), len(skipped))
+        else:
+            log.info("Processed %d plot(s): %d ok, %d failed, %d skipped.",
+                     len(succeeded) + len(failed), len(succeeded), len(failed), len(skipped))
+            if failed:
+                log.warning("Failed: %s", ", ".join(failed))
+        if skipped:
+            log.warning("Skipped (no .ini): %s", ", ".join(skipped))
+
+    # A dry run executes nothing, so `succeeded` is empty and the plots it *would* have
+    # processed sit in `planned`. Report those as the successes so a caller (the chained
+    # driver) sees the same shape either way and can narrate a full dry run.
+    return {
+        "succeeded": planned if dry_run else succeeded,
+        "failed": failed,
+        "skipped": skipped,
+    }

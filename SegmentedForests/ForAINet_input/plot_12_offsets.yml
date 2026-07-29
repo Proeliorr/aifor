@@ -1,0 +1,25 @@
+plot: plot_12
+offset_x: -47.77000045776367
+offset_y: -55.93000030517578
+offset_z: -0.33999999999999997
+original_min_x: -47.77000045776367
+original_min_y: -55.93000030517578
+original_min_z: -0.33999999999999997
+original_range_x: 60.0
+original_range_y: 60.0000005
+original_range_z: 23.09
+n_points: 64713792
+n_points_source: 64713792
+n_points_dropped: 0
+n_tree_ids_zeroed: 39480063
+split: train
+ply_file: plot_12_train.ply
+source_format: las
+source_file: plot_12_tree_ID_dist_axes.las
+las_version: '1.4'
+point_format: 7
+scales:
+- 1.0e-07
+- 1.0e-07
+- 1.0e-07
+crs_wkt: null

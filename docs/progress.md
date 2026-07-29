@@ -325,6 +325,85 @@ Dates follow the Hydra run logs in `outputs/<date>/<time>/`.
   first `bytes_per_point` guess of 60 counted only the obvious arrays, missing that
   `plyfile.write()` does `data.astype(...).tobytes()` — two more full copies.
 
+## 2026-07-29 — Stage 2 assigns train / val / test via the file name
+
+- **Why it was needed.** ForAINet has no split manifest — it reads the set from the FILE
+  NAME (`name[-7:-4] == "val"`, then `name[-8:-4] == "test"`, everything else training).
+  Stage 2 wrote plain `<plot>.ply`, so **every plot landed in training** and there was no
+  validation or test set at all. Output is now `<plot>_train.ply` / `_val.ply` /
+  `_test.ply`, matching the reference dataset (`old_training_dataset/NIBIO2`: 29 train,
+  15 test, 6 val — and `_val`, never `_eval`).
+- **The rule** (`assign_splits()`): plots ranked by point count **descending**, the
+  smallest held out — most points stay in training. New `forainet_prep.split` block takes
+  `n_val`/`n_test` as either a count (`int`) or a fraction of the plots (`float` < 1,
+  rounded, min 1), so the same config fits a dataset of any size. On the 14 plots the
+  defaults `1`/`2` give **plot_11 → val, plot_14 + plot_01 → test, 11 train**.
+  Ties break on plot name, so equal-sized plots never swap roles between runs; a split
+  leaving zero training plots raises rather than producing an empty training set.
+- **Computed over every matched cloud, before the `plots` filter** — otherwise
+  `plots=[plot_01]` would make plot_01 "the smallest" and mark it validation. Verified:
+  running plot_01 alone still writes `plot_01_test.ply`.
+- **Stale siblings are removed.** A plot can change split (a new plot shifts the ranking,
+  or `n_test` changes), and ForAINet globs `raw/**/*.ply` — leaving the old file would
+  load that plot **twice, in two different splits**, training on its own test data. The
+  old file is deleted with a warning.
+- `<plot>_offsets.yml` keeps the plain plot name (it describes geometry, not a split) and
+  gains `split` + `ply_file`. `_restore_plot_name` now strips the suffix too, so
+  `plot_11_val.ply` still resolves to `plot_11_offsets.yml` — verified by a restore
+  round-trip.
+- `split: null` reproduces the previous `<plot>.ply` naming exactly.
+- Verified end to end: every generated name fed back through **ForAINet's own**
+  `[-7:-4]`/`[-8:-4]` test returns the split we intended; fractions `0.07`/`0.14` on 14
+  plots reproduce the `1`/`2` assignment, and `0.1`/`0.2` on 50 plots give 5 val / 10
+  test / 35 train.
+
+---
+
+## 2026-07-30 — The chain: stages run per plot, intermediates deleted as they are consumed
+
+- **Why it was needed.** Run as separate stages, each handed the next a *complete*
+  folder, so the disk cost was the sum of every stage at once. Measured for a **4.4 GB
+  input**: `3DFin_output/` 46.3 GB + `ClassUnifier_output/` 25.3 GB + a stale
+  `ForAINet_input/` 29.2 GB + `raw/` + `processed_0.2/` = **108.6 GB**. 3DFin wrote all
+  fourteen `.las` files before Stage 2 read the first one, and each became dead weight
+  the moment Stage 2 consumed it.
+- **`pipeline/chain.py` + `main_pipeline.py` now drive the whole pipeline per plot**:
+  3DFin → Stage 2 → delete that plot's `.las`. Transient cost falls from all fourteen
+  intermediates (46.3 GB) to the largest single one (**15.2 GB**, plot_08). 3DFin is an
+  external CLI and can only hand over a file, so consuming it immediately is as close to
+  "not exporting between stages" as the tool allows.
+- **The chain adds no processing.** It calls `run_pipeline()` and `prep_forainet()` —
+  the same functions the standalone entry scripts call — reading the same `threedfin:`
+  and `forainet_prep:` sections, so a chained run and a stage-by-stage run cannot drift
+  apart. Verified: the chain's `plot_11_val.ply` is **byte-identical** (SHA-256) to the
+  one the old two-step route produced, offsets file included.
+- **The split had to be decided up front.** Stage 2 ranks plots by point count and holds
+  out the smallest, but the chain feeds it one plot at a time — which could not be
+  ranked against anything. So the ranking is taken from the **source** `.laz` headers
+  before 3DFin runs and passed down as the new `split_of` parameter. Sound because 3DFin
+  preserves point counts exactly (checked across all 14 plots, zero delta); the chain
+  reproduces `plot_11 → val, plot_14 + plot_01 → test`.
+- **Deletion is conservative.** Only after Stage 2 reports that plot as *succeeded*;
+  only point-cloud files (`3dfin_log.txt` survives, so the folder still records the run);
+  and never when Stage 2 is not in `stages`, since then the `.las` *is* the output.
+  Verified by forcing a Stage 2 failure — the 15-minute-to-regenerate file stayed put and
+  the log said why.
+- **New `chain:` config section**: `stages` (either stage alone still works),
+  `keep_intermediates` (`false` / `true` / **a list of plot names**, which is how the
+  opt-in `class_unifier` diagnostics stay practical — it needs the `tree_ID` only 3DFin
+  produces), `plots`, `overwrite` (defaults to `false`, so an interrupted run resumes
+  instead of repeating hours of 3DFin), `dry_run`, `continue_on_error`.
+- Both stage engines now **return** their `{succeeded, failed, skipped}` tallies (they
+  already built them for the summary line) and take `log_summary=False`, which drops the
+  run-level framing when they are called once per plot — otherwise a 14-plot chained run
+  logged 28 summary blocks.
+- **Breaking change**: `python main_pipeline.py` used to mean "3DFin only". That is now
+  `chain.stages=[threedfin]`; the bare command runs the whole chain.
+- Cleanup after the change: the 46.3 GB of `3DFin_output` clouds were consumed by a
+  `chain.stages=[forainet_prep]` run that regenerated all 14 training PLYs, and the stale
+  `ClassUnifier_output/` and `ForAINet_input/*.ply` were removed (the tracked
+  `*_offsets.yml` kept).
+
 ---
 
 ## Planned

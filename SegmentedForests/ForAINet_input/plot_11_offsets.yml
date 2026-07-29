@@ -1,0 +1,25 @@
+plot: plot_11
+offset_x: -16.999000549316406
+offset_y: -16.99799919128418
+offset_z: -3.4519998999999997
+original_min_x: -16.999000549316406
+original_min_y: -16.99799919128418
+original_min_z: -3.4519998999999997
+original_range_x: 33.997999199999995
+original_range_y: 33.997999199999995
+original_range_z: 22.7649996
+n_points: 18945417
+n_points_source: 18945417
+n_points_dropped: 0
+n_tree_ids_zeroed: 4489350
+split: val
+ply_file: plot_11_val.ply
+source_format: las
+source_file: plot_11_tree_ID_dist_axes.las
+las_version: '1.4'
+point_format: 7
+scales:
+- 1.0e-07
+- 1.0e-07
+- 1.0e-07
+crs_wkt: null

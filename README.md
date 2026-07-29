@@ -6,12 +6,16 @@ It is configured and launched with
 [hydra-zen](https://mit-ll-responsible-ai.github.io/hydra-zen/); each stage has its own
 entry script reading its own section of the shared `conf/config.yaml`:
 
-- **Stage 1 — 3DFin instance segmentation** (`main_pipeline.py`): drives the
+- **Stage 1 — 3DFin instance segmentation** (`pipeline/threedfin.py`): drives the
   [3DFin](https://github.com/3DFin/3DFin) v0.6.0 CLI over every plot (`*.laz` +
   matching `<stem>.ini`), producing one instance-segmented cloud per plot.
 - **Stage 2 — ForAINet preparation** (`forainet_prep.py`): centers each cloud's
   coordinates, writes ForAINet-ready PLYs + per-plot offset/metadata files, and
   **restores** classified results to original coordinates (LAZ 1.4, CRS re-applied).
+- **The chain** (`main_pipeline.py`): runs both stages **per plot** and deletes each
+  3DFin intermediate as soon as Stage 2 has consumed it — see
+  [Running the pipeline](#running-the-pipeline). One command takes the raw clouds to
+  the PLYs ForAINet trains on.
 
 The development history — what was added when and why — is tracked in
 [`progress.md`](progress.md).
@@ -31,12 +35,13 @@ The development history — what was added when and why — is tracked in
 
 | File | Role |
 |---|---|
-| [`main_pipeline.py`](main_pipeline.py) | **Stage 1 entry point.** `@hydra.main` loads the shared `conf/config.yaml` and runs the 3DFin stage from its `threedfin:` section via `zen(run_pipeline)(cfg.threedfin)` (hydra-zen maps the section's keys onto the function's parameters). |
+| [`main_pipeline.py`](main_pipeline.py) | **Whole-pipeline entry point.** `@hydra.main` loads the shared `conf/config.yaml` and runs the chain from its `chain:` section. (It reads all three sections at once, so unlike the other entry scripts it converts the config itself instead of using `zen()`, which maps a *single* section onto a function.) |
+| [`pipeline/chain.py`](pipeline/chain.py) | **Chain engine.** `run_chain(...)` calls the two stage engines **per plot** and deletes each 3DFin `.las` once Stage 2 has succeeded for that plot, so the transient cost is one intermediate rather than all fourteen. Adds no processing of its own. Helpers: `_call` (invoke an engine with its config section, filtered to the parameters it accepts), `_keeps` (the three-way `keep_intermediates` switch), `_delete_clouds`. |
 | [`pipeline/threedfin.py`](pipeline/threedfin.py) | **Stage 1 engine.** `run_pipeline(...)` collects `*.laz` files, pairs each with its `.ini`, builds and executes the `3DFin cli ...` command per plot, and prints a summary. Helpers: `_read_misc_flags` (read `[misc]` flags from an `.ini`), `_write_patched_ini` (write the patched copy — see quirks below), `_build_command` (assemble the argument vector). |
 | [`forainet_prep.py`](forainet_prep.py) | **Stage 2 entry point.** Same pattern as `main_pipeline.py`, running the ForAINet preparation from `config.yaml`'s `forainet_prep:` section via `zen(prep_forainet)(cfg.forainet_prep)`. See "Stage 2" below. |
 | [`pipeline/forainet_prep.py`](pipeline/forainet_prep.py) | **Stage 2 engine.** `prep_forainet(...)` centers each plot cloud (subtracts min x/y/z), writes ForAINet-ready PLYs + per-plot `<plot>_offsets.yml`, and can **restore** classified results to original coordinates. |
 | [`pipeline/__init__.py`](pipeline/__init__.py) | Package init; re-exports `run_pipeline` and `prep_forainet`. |
-| [`conf/config.yaml`](conf/config.yaml) | **Pipeline config.** One section per stage — `threedfin:` (Stage 1) and `forainet_prep:` (Stage 2) — each read by its own entry script. Override any key with its section prefix, e.g. `threedfin.plots=[plot_01]`. |
+| [`conf/config.yaml`](conf/config.yaml) | **Pipeline config.** One section per stage — `chain:`, `threedfin:` (Stage 1), `class_unifier:` (diagnostics) and `forainet_prep:` (Stage 2) — plus the shared `paths:` and `classes:` blocks both label stages interpolate. Override any key with its section prefix, e.g. `threedfin.plots=[plot_01]`. |
 | [`misc/`](misc/README.md) | **Standalone tools outside the pipeline.** `misc/tree_splitter.py` (per-tree `.npy` splitting, own `misc/conf/config.yaml`) and `misc/Points2ForAINet.py` (the original generic converter Stage 2 was ported from). |
 | [`requirements.txt`](requirements.txt) | Pinned Python deps (`hydra-zen`, `hydra-core`, `omegaconf`, `laspy`, `lazrs`, `plyfile`, `PyYAML`), all already satisfied by the `aifor` env. **3DFin itself is an external CLI, not a pip dependency of this package.** |
 | [`progress.md`](progress.md) | **Development history** — what functionality was added when, and what is planned. |
@@ -140,6 +145,37 @@ ForAINet's fifth class (`branches`) receives nothing and was removed from the fr
 itself — those edits live in [`patches/forainet-local.patch`](patches/README.md), since
 `ForAINet/` is a pinned submodule.
 
+### Train / val / test — carried by the file name
+
+ForAINet has no split manifest. It decides from the **file name**, testing
+`name[-7:-4] == "val"`, then `name[-8:-4] == "test"`, and treating anything else as
+training data. Stage 2 therefore writes `<plot>_train.ply`, `<plot>_val.ply` or
+`<plot>_test.ply` — without a suffix every plot would silently become training data.
+
+Plots are ranked by point count and the **smallest are held out**, keeping the bulk of
+the points for training. The `split:` block under `forainet_prep:` controls it:
+
+```yaml
+split:
+  n_val: 1        # a count, or a fraction of the plots: 0.1 = 10%
+  n_test: 2
+```
+
+On the 14 plots that gives `plot_11 → val`, `plot_14` and `plot_01 → test`, the other 11
+training. Because each value may be a fraction, the same block fits a dataset with a
+different number of plots. `split: null` writes plain `<plot>.ply`.
+
+Two behaviours worth knowing:
+
+- The assignment is computed over **every matched cloud, before** `plots` narrows the
+  run — so processing one plot still gives it the suffix a full run would.
+- If a plot changes split, its previous file is **deleted**. ForAINet globs
+  `raw/**/*.ply`, so a plot left with two suffixes would be loaded into two sets at once
+  and train on its own test data.
+
+`<plot>_offsets.yml` keeps the plain plot name and records the split, so `restore` still
+finds it.
+
 #### Checking the merge did what you meant
 
 `class_unifier.py` applies the same map and writes an inspection copy of each plot to
@@ -178,25 +214,129 @@ the 3DFin executable.
 
 ---
 
-## Stage 1 — run the 3DFin batch
+## Running the pipeline
 
-Run from inside the `assignment/` folder, within the `aifor` env. Overrides use the
-`threedfin.` section prefix (the stage's keys live under `threedfin:` in `config.yaml`):
+### The short version
 
 ```bash
-# Full batch (all plots)
+mamba run -n aifor python main_pipeline.py
+```
+
+That takes the unprocessed clouds in `SegmentedForests/pointclouds/` all the way to the
+PLYs ForAINet trains on, **one plot at a time**: 3DFin, then Stage 2, then the plot's
+3DFin `.las` is deleted because nothing needs it any more. Add `chain.dry_run=true`
+first to see the plan (and each 3DFin command) without writing anything.
+
+### Why it works plot by plot
+
+Run as separate stages, each hands the next a **complete folder**. Measured on the 14
+SegmentedForests plots, for a 4.4 GB input:
+
+| folder | size |
+|---|---|
+| `SegmentedForests/pointclouds/` (the input) | 4.4 GB |
+| `SegmentedForests/3DFin_output/` | 46.3 GB |
+| `SegmentedForests/ClassUnifier_output/` (diagnostics, optional) | 25.3 GB |
+| `…/treeinsfused/raw/` (what ForAINet trains on) | ~25 GB |
+
+3DFin writes all fourteen `.las` files before Stage 2 reads the first one, and every one
+of them is dead weight the moment Stage 2 has consumed it. The chain instead keeps
+**one** intermediate alive at a time — 15.2 GB for the biggest plot, rather than 46.3 GB
+for all of them.
+
+3DFin is an external command-line program, so it can only hand over its result as a
+file; there is no way to avoid writing it. Consuming it immediately is the next best
+thing.
+
+**The price:** re-running Stage 2 alone later — a changed class map, a changed split —
+needs that `.las` back, which means re-running 3DFin (hours, not minutes). While you are
+still tuning the class scheme, set `chain.keep_intermediates=true`.
+
+### Which command produces what
+
+Every stage still has its own entry script and can be run on its own. Pick the row you
+need:
+
+| Run | Requires on disk | Produces | Disk |
+|---|---|---|---|
+| `python main_pipeline.py` | `pointclouds/*.laz` + `3DFin_settings/*.ini` | training PLYs + `<plot>_offsets.yml` | ≤15 GB transient, ~25 GB kept |
+| `python main_pipeline.py chain.stages=[threedfin]` | same | `3DFin_output/<plot>/*.las` (nothing deleted) | 46 GB |
+| `python main_pipeline.py chain.stages=[forainet_prep]` | `3DFin_output/**/*.las` | training PLYs + offsets, **consuming** the `.las` | frees 46 GB |
+| `python forainet_prep.py` | `3DFin_output/**/*.las` | training PLYs + offsets, keeping the `.las` | ~25 GB |
+| `python class_unifier.py` | `3DFin_output/**/*.las` | diagnostic PLYs (source + unified labels side by side) | ~25 GB |
+| `python forainet_prep.py forainet_prep.mode=restore forainet_prep.restore_dir=…` | classified PLYs + `<plot>_offsets.yml` | `restored_<plot>.laz` in original coordinates | — |
+
+`python forainet_prep.py` and `python main_pipeline.py chain.stages=[forainet_prep]` do
+exactly the same work — the chain form processes plots one at a time and deletes as it
+goes, the standalone form runs several at once (memory-budgeted) and keeps everything.
+
+### Re-entering at a stage
+
+```bash
+# Resume an interrupted run: chain.overwrite is false by default, so plots whose
+# training PLY already exists are skipped without re-running 3DFin.
 mamba run -n aifor python main_pipeline.py
 
+# Redo one plot from scratch
+mamba run -n aifor python main_pipeline.py chain.plots=[plot_02] chain.overwrite=true
+
+# Stage 1 only, keeping the .las (this is what main_pipeline.py did before the chain)
+mamba run -n aifor python main_pipeline.py chain.stages=[threedfin]
+
+# Changed the class map? Stage 2 alone needs the .las back. Either it was kept, or:
+mamba run -n aifor python main_pipeline.py chain.stages=[threedfin]   # hours
+mamba run -n aifor python forainet_prep.py                            # minutes
+
+# Inspect a class merge (class_unifier reads tree_ID, which only 3DFin produces),
+# keeping just that plot's intermediate rather than all 46 GB:
+mamba run -n aifor python main_pipeline.py chain.plots=[plot_02] chain.keep_intermediates=[plot_02]
+mamba run -n aifor python class_unifier.py class_unifier.plots=[plot_02]
+```
+
+> **Delete `…/treeinsfused/processed_0.2/` whenever `raw/` changes.** ForAINet caches
+> its preprocessed tensors there and will happily keep training on the stale ones.
+
+Keys under the `chain:` section of `conf/config.yaml`:
+
+| Key | Meaning |
+|---|---|
+| `stages` | Which stages, in order. `[threedfin, forainet_prep]` (default), or either alone. |
+| `keep_intermediates` | `false` (default) = delete each plot's 3DFin `.las` once Stage 2 has succeeded for it; `true` = keep them all; a **list** of plot names = keep only those. Only point clouds are removed — `3dfin_log.txt` stays, so the folder still records the run. |
+| `plots` | `null` = every cloud in `threedfin.pointclouds_dir`; or a list. |
+| `overwrite` | `false` (default) = skip plots whose final output exists, so a run resumes; `true` = redo everything. |
+| `dry_run` | Log the plan (and each 3DFin command) without writing or deleting anything. |
+| `continue_on_error` | `true` (default) = keep going after a plot fails. |
+
+Nothing is deleted unless `forainet_prep` is in `stages` **and** it reported that plot as
+succeeded. A failure leaves the expensive `.las` in place, so the retry costs minutes.
+
+---
+
+## Stage 1 — run the 3DFin batch
+
+Stage 1 is normally reached through the chain above. To run it on its own — the full
+batch, nothing deleted — use `chain.stages=[threedfin]`. Its own settings live under
+`threedfin:` in `config.yaml` and take the `threedfin.` prefix:
+
+```bash
+# Full batch (all plots), 3DFin only
+mamba run -n aifor python main_pipeline.py chain.stages=[threedfin]
+
 # Dry run — print the 3DFin command for each plot, write nothing
-mamba run -n aifor python main_pipeline.py threedfin.dry_run=true
+mamba run -n aifor python main_pipeline.py chain.stages=[threedfin] chain.dry_run=true
 
 # A single plot (or a list)
-mamba run -n aifor python main_pipeline.py threedfin.plots=[plot_11]
-mamba run -n aifor python main_pipeline.py threedfin.plots=[plot_01,plot_05]
+mamba run -n aifor python main_pipeline.py chain.stages=[threedfin] chain.plots=[plot_11]
+mamba run -n aifor python main_pipeline.py chain.stages=[threedfin] chain.plots=[plot_01,plot_05]
 
-# Override any config key on the command line
-mamba run -n aifor python main_pipeline.py threedfin.pointclouds_dir=/other/path threedfin.normalize=true
+# Override any of the stage's own config keys on the command line
+mamba run -n aifor python main_pipeline.py chain.stages=[threedfin] threedfin.normalize=true
 ```
+
+> **Changed:** `python main_pipeline.py` used to mean "3DFin only". It now runs the whole
+> chain; `chain.stages=[threedfin]` is the old behaviour. Note that `chain.plots` selects
+> the plots (the chain drives the loop), while `threedfin.*` still configures how each
+> 3DFin run is made.
 
 Useful keys under the `threedfin:` section of `conf/config.yaml`:
 

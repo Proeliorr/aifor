@@ -10,8 +10,13 @@ Forest LiDAR point-cloud pipeline preparing plot clouds for **ForAINet semantic
 segmentation** (resolved at whole-plot level — per-tree data is intentionally out of
 scope; tools for that live in `misc/`).
 
-- **Stage 1** `main_pipeline.py` → `pipeline/threedfin.py`: batch-runs the 3DFin v0.6.0
-  CLI per plot (instance segmentation, `<plot>_tree_ID_dist_axes.las`).
+- **The chain** `main_pipeline.py` → `pipeline/chain.py`: runs the stages **per plot**
+  (3DFin → Stage 2 → delete that plot's `.las`) so only one intermediate is alive at a
+  time — 15.2 GB instead of 46.3 GB. Adds no processing: it calls the same two engines
+  with the same config sections. `chain.stages=[threedfin]` is Stage 1 alone (what
+  `main_pipeline.py` used to mean).
+- **Stage 1** `pipeline/threedfin.py`: batch-runs the 3DFin v0.6.0 CLI per plot
+  (instance segmentation, `<plot>_tree_ID_dist_axes.las`).
 - **Stage 2** `forainet_prep.py` → `pipeline/forainet_prep.py`: centers coordinates
   (min-subtraction → all ≥ 0), writes ForAINet PLYs + `<plot>_offsets.yml`
   (shifts + source metadata: format, LAS version/point format/scales, CRS WKT);
@@ -48,6 +53,14 @@ module because `class_unifier` imports the reader from `forainet_prep`, so
 - Stage 2 drops points **before** computing the centering offsets, so
   `<plot>_offsets.yml` describes the points actually in the PLY (`restore` validates
   against them). A restored cloud is therefore smaller than the 3DFin input.
+- **Split lives in the FILE NAME.** ForAINet has no manifest: it tests
+  `name[-7:-4]=="val"` then `name[-8:-4]=="test"`, everything else being training data.
+  Stage 2's `split:` block (`n_val`/`n_test`, each a count or a fraction) ranks plots by
+  point count and holds out the **smallest** — currently plot_11 → val, plot_14 + plot_01
+  → test. Computed over *all* matched clouds before the `plots` filter, so a subset run
+  gives the same suffix a full run would. Changing the split deletes the plot's old file:
+  ForAINet globs `raw/**/*.ply`, so two suffixes for one plot would train on test data.
+  `<plot>_offsets.yml` stays keyed by the plain plot name.
 - **`treeID` convention (easy to get wrong):** ForAINet needs `0` = "not part of any
   tree", and skips any instance whose id also appears on a non-thing point. 3DFin
   instead gives every point the nearest stem's id — ground included — which made
@@ -65,8 +78,11 @@ module because `class_unifier` imports the reader from `forainet_prep`, so
   `conf/config.yaml`.
 
 Config pattern: one shared `conf/config.yaml`, one section per stage
-(`threedfin:`, `class_unifier:`, `forainet_prep:`), one hydra-zen entry script per
-stage. Override keys with the section prefix: `forainet_prep.plots=[plot_02]`.
+(`chain:`, `threedfin:`, `class_unifier:`, `forainet_prep:`), one hydra-zen entry script
+per stage. Override keys with the section prefix: `forainet_prep.plots=[plot_02]`.
+`main_pipeline.py` is the exception — the chain needs three sections at once, and `zen()`
+maps a *single* section onto a function, so it converts the config itself
+(`OmegaConf.to_container(cfg, resolve=True)`).
 
 ## Environment / running
 
@@ -80,11 +96,15 @@ stage. Override keys with the section prefix: `forainet_prep.plots=[plot_02]`.
 
 ## Data (gitignored, machine-local)
 
-`SegmentedForests/`: `pointclouds/` (plot_01–14.laz, local coordinates, **no CRS**),
-`3DFin_settings/` (per-plot .ini, tracked), `3DFin_output/` (Stage 1 results),
-`ForAINet_input/` (Stage 2 PLYs; only the small `*_offsets.yml` are tracked).
-Paths in `conf/config.yaml` are absolute and machine-specific — adjust or override
-on other machines.
+`SegmentedForests/`: `pointclouds/` (plot_01–14.laz, local coordinates, **no CRS**,
+4.4 GB — the only permanent input), `3DFin_settings/` (per-plot .ini, tracked),
+`3DFin_output/` (Stage 1 results — normally just `3dfin_log.txt` per plot, since the
+chain consumes the clouds), `ForAINet_input/` (**now only the tracked
+`*_offsets.yml`**; Stage 2's PLYs go straight to `paths.forainet_raw` inside the
+ForAINet submodule, ~29 GB). Paths in `conf/config.yaml` are absolute and
+machine-specific — adjust or override on other machines.
+Delete `…/treeinsfused/processed_0.2/` whenever `raw/` changes: ForAINet caches its
+preprocessed tensors there and will otherwise train on the stale ones.
 
 ## Conventions
 
@@ -94,9 +114,22 @@ on other machines.
   `continue_on_error`, `=`-rule summary log line.
 - laspy gotcha: materialise accessors with `np.asarray(...)` (ScaledArrayView /
   SubFieldView are not plain arrays).
+- **Intermediates are transient.** The chain deletes each plot's 3DFin `.las` once
+  Stage 2 has succeeded for that plot — only point clouds, never `3dfin_log.txt`, never
+  when Stage 2 is absent from `stages`, never after a failure (the retry must not cost
+  another 3DFin run). `keep_intermediates` is `false` / `true` / a **list of plot
+  names**; the list form is what makes the opt-in `class_unifier` diagnostics workable,
+  since it reads the `tree_ID` only 3DFin produces. Measured: 108.6 → 34.3 GB.
+- **The chain decides the split from the SOURCE headers** and passes it to Stage 2 as
+  `split_of`, because a per-plot call cannot rank a plot against the others. Valid only
+  because 3DFin preserves point counts exactly (verified, all 14 plots, zero delta) — if
+  that ever stops being true, the split silently becomes arbitrary.
+- Both stage engines **return** `{succeeded, failed, skipped}` (the chain acts on it) and
+  take `log_summary=False` to drop the run-level framing when called once per plot.
 - **Parallelism** (`pipeline/parallel.py`): `class_unifier`, `forainet_prep` and
   `misc/tree_splitter` run several plots at once in worker *processes*; 3DFin
-  (Stage 1) stays sequential. Concurrency is bounded by **RAM, not cores** — Stage 2
+  (Stage 1) stays sequential, and the chain passes `workers=1` since it hands Stage 2
+  one plot at a time. Concurrency is bounded by **RAM, not cores** — Stage 2
   costs a measured ~134 bytes/point, so plot_08 (280 M pts) needs ~37 GB alone and a
   worker per core would exhaust the machine. Sizes come from LAS headers; work is
   admitted while it fits `memory_budget_frac` of RAM. `workers: 1` = inline, the old

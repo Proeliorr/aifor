@@ -3,6 +3,37 @@
 # prefix, e.g. `threedfin.plots=[plot_01]` or `threedfin.dry_run=true`.
 
 # ============================================================================
+# Paths — the one place machine-specific locations are written down
+#
+# `forainet_raw` is where Stage 2 puts the clouds ForAINet trains on. It is NOT a
+# free choice: ForAINet assembles the path itself and then globs it.
+#
+#   base_dataset.py     _data_path = <dataroot>/<dataset_name>
+#                       ...where dataset_name falls back to the DATASET CLASS NAME,
+#                       lower-cased and minus "dataset" -> "treeinsfused". That part
+#                       is baked into the Python, not configurable.
+#   torch_geometric     raw_dir    = <_data_path>/raw
+#   treeins_set1.py     glob(raw_dir + "/**/*.ply", recursive=True)
+#
+# `dataroot` (data_set1_5classes) comes from ForAINet's OWN
+# conf/data/panoptic/treeins_set1.yaml — change it there and change it here too.
+# The final folder is free, because the glob is recursive; it just groups our plots
+# the way the reference data groups NIBIO2/CULS/SCION/...
+#
+# Since this lives inside the pinned ForAINet submodule, that checkout has to exist
+# (`git submodule update --init`) before Stage 2 can write.
+# ============================================================================
+paths:
+  assignment: D:\Podyplomowe\04_AI_Intro\assignment
+  forainet: ${paths.assignment}\ForAINet\PointCloudSegmentation
+  forainet_dataroot: ${paths.forainet}\data_set1_5classes
+  forainet_raw: ${paths.forainet_dataroot}\treeinsfused\raw\SegmentedForests
+  # Our own metadata stays in the repo, outside the submodule: the small
+  # <plot>_offsets.yml files are tracked (see .gitignore) and are what makes a
+  # restore possible, so they should not disappear into ForAINet's data folder.
+  offsets: ${paths.assignment}\SegmentedForests\ForAINet_input
+
+# ============================================================================
 # Semantic class scheme — SegmentedForests labels -> ForAINet labels
 #
 # NOT A STAGE: nothing runs this on its own, there is no engine behind it. It is
@@ -107,8 +138,52 @@ classes:
   instance_classes: [3, 4]     # stem_points, live_branches
 
 # ============================================================================
+# The chain — run the stages back to back, one plot at a time
+#   run with: python main_pipeline.py   (engine: pipeline/chain.py)
+#
+# Run separately, the stages hand each other WHOLE FOLDERS: 3DFin writes all fourteen
+# .las files (46 GB, measured) before Stage 2 reads the first one, and every one of them
+# is dead weight the moment Stage 2 has consumed it. The chain runs both stages per plot
+# and deletes each .las as soon as that plot's training PLY exists, so the transient cost
+# is one plot's intermediate (15.2 GB for the biggest) instead of all of them at once.
+#
+# It adds no processing of its own — it calls the same two engines, configured by the
+# same two sections below, so a chained run and a stage-by-stage run cannot drift apart.
+# Each stage keeps its own entry script; this is an extra way to run them.
+#
+# The PRICE of deleting: re-running Stage 2 alone later (a changed class map, a changed
+# split) needs the .las back, which means re-running 3DFin — hours, not minutes. While
+# you are still tuning the class scheme, set `keep_intermediates: true`.
+# ============================================================================
+chain:
+  # Which stages to run, in order. [threedfin] alone reproduces what this entry script
+  # did before the chain existed (3DFin only, nothing deleted); [forainet_prep] alone
+  # converts already-produced 3DFin output, consuming it as it goes.
+  stages: [threedfin, forainet_prep]
+
+  # false = delete each plot's 3DFin .las once Stage 2 has succeeded for that plot
+  # true  = keep them all (tuning the class scheme, or running the diagnostics stage)
+  # [plot_02, plot_10] = keep only these — enough to inspect a class merge with
+  #                      class_unifier.py, which needs the tree_ID only 3DFin produces,
+  #                      without paying for all 14.
+  # Only the point clouds go: 3dfin_log.txt stays, so the folder still records the run.
+  # Nothing is ever deleted unless forainet_prep is in `stages` and reported that plot
+  # as succeeded — a failure leaves the expensive file in place for a cheap retry.
+  keep_intermediates: false
+
+  plots: null               # null = every cloud in threedfin.pointclouds_dir; or [plot_01, ...]
+
+  # false = skip a plot whose FINAL output already exists, so an interrupted run resumes
+  # instead of repeating hours of 3DFin. true = redo everything.
+  overwrite: false
+
+  dry_run: false            # log the plan (and each 3DFin command) without writing anything
+  continue_on_error: true
+
+# ============================================================================
 # Stage 1 — 3DFin instance segmentation (adds tree_ID per point). This data will be used for training the instance segmentation head.
-#   run with: python main_pipeline.py   (engine: pipeline/threedfin.py)
+#   run standalone with: python main_pipeline.py chain.stages=[threedfin]
+#   (engine: pipeline/threedfin.py — also called per plot by the chain above)
 # ============================================================================
 threedfin:
   # --- Input / output folders (edit these) ---
@@ -201,6 +276,7 @@ class_unifier:
 # ============================================================================
 # Stage 2 — prepare plots for ForAINet (center coordinates + PLY) / restore results
 #   run with: python forainet_prep.py   (engine: pipeline/forainet_prep.py)
+#   also called per plot by the chain above, which reads this same section
 # ============================================================================
 forainet_prep:
   # --- Mode ---
@@ -215,10 +291,12 @@ forainet_prep:
   # `patterns` are matched directly in input_dir (flat layout) AND one level down in
   # per-plot subfolders (the 3DFin output tree). Narrow to ["*_tree_ID_dist_axes.las"]
   # when plot folders hold more than one matching cloud (e.g. prune_outputs=false).
-  input_dir:  D:\Podyplomowe\04_AI_Intro\assignment\SegmentedForests\3DFin_output
+  input_dir:  ${paths.assignment}\SegmentedForests\3DFin_output
   patterns: ["*.las", "*.laz", "*.ply"]
-  # Folder receiving <plot>.ply + <plot>_offsets.yml (created if missing).
-  output_dir: D:\Podyplomowe\04_AI_Intro\assignment\SegmentedForests\ForAINet_input
+  # The PLYs go straight where ForAINet globs for them, so no copy step and no
+  # chance of training on a stale copy. See the `paths:` block for why that
+  # location is fixed rather than chosen.
+  output_dir: ${paths.forainet_raw}
 
   # --- preprocess mode: source field names ---
   # Label and tree-id columns come from the shared `classes:` block at the top of
@@ -240,9 +318,35 @@ forainet_prep:
   # what ForAINet's instance grouping requires -- see the note in `classes:`.
   instance_classes: ${classes.instance_classes}
 
+  # --- preprocess mode: train / val / test assignment ---
+  # ForAINet has no split manifest: it reads the set from the FILE NAME, testing
+  # `name[-7:-4] == "val"` then `name[-8:-4] == "test"` and treating everything else
+  # as training data. So Stage 2 writes <plot>_train.ply / _val.ply / _test.ply.
+  # Without this every plot would land in training and there would be no validation
+  # or test set at all.
+  #
+  # Plots are ranked by point count and the SMALLEST are held out, keeping the bulk
+  # of the points for training. Each value is either an exact number of plots (int)
+  # or a fraction of them (float below 1, rounded, minimum 1) — so the same block
+  # suits a dataset with a different number of plots. On the 14 SegmentedForests
+  # plots the values below give plot_11 -> val, plot_14 + plot_01 -> test.
+  #
+  # The assignment is computed over EVERY matched cloud, before `plots` narrows the
+  # run, so processing a single plot still gives it the suffix a full run would.
+  # (The chain cannot do that — it sees one plot at a time — so it ranks the SOURCE
+  # clouds up front instead and passes the result down; 3DFin preserves point counts
+  # exactly, so both routes agree.) `split: null` restores the plain <plot>.ply naming.
+  split:
+    n_val: 1        # or 0.1 for 10% of the plots
+    n_test: 2       # or 0.2 for 20%
+
   # --- restore mode ---
   restore_dir: null         # folder of classified *.ply to restore (required for mode=restore)
-  offsets_dir: null         # where the <plot>_offsets.yml live; null = output_dir
+  # Where the <plot>_offsets.yml live, in BOTH modes (null = alongside the clouds).
+  # Kept out of the ForAINet submodule on purpose: these are small, tracked by git
+  # (see .gitignore) and are the only thing that makes `restore` possible, so they
+  # should not be buried in a data folder that is wiped when datasets change.
+  offsets_dir: ${paths.offsets}
   # laz (default) = compressed LAS 1.4 with the source scales + CRS re-applied and all
   # extra fields (labels, predictions) kept as extra-bytes dimensions; las = same,
   # uncompressed; ply = plain PLY.

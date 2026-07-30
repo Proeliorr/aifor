@@ -1,3 +1,24 @@
+diff --git a/PointCloudSegmentation/conf/models/panoptic/FORpartseg_3heads.yaml b/PointCloudSegmentation/conf/models/panoptic/FORpartseg_3heads.yaml
+index fa9002b..84d40b5 100644
+--- a/PointCloudSegmentation/conf/models/panoptic/FORpartseg_3heads.yaml
++++ b/PointCloudSegmentation/conf/models/panoptic/FORpartseg_3heads.yaml
+@@ -174,4 +174,15 @@ PointGroup-PAPER:
+   cluster_type: 7
+   vizual_ratio: 0
+ 
+-  path_pretrained: "/cluster/work/igp_psr/binbin/OutdoorPanopticSeg_V2/outputs/setting1_classes5_mixtree_1000/setting1_classes5_mixtree_1000-PointGroup-PAPER-20240205_132553/PointGroup-PAPER.pt"
++  # LOCAL PATCH (SegmentedForests): was a FIVE-class checkpoint on the original author's
++  # cluster ("setting1_classes5_mixtree_1000/...PointGroup-PAPER.pt"). Two reasons it is
++  # null now:
++  #   1. The path does not exist here, so it only ever produced
++  #      "The path does not exist, it will not load any model" (base_model.py:154) --
++  #      every run was already training from scratch, by accident rather than by choice.
++  #   2. If it ever DID resolve, base_model.py calls
++  #      load_state_dict_with_same_shape(m, strict=False), which silently skips layers
++  #      whose shape changed. Our semantic head is 4-wide, that checkpoint's is 5, so the
++  #      head would be quietly dropped and you would believe you were fine-tuning.
++  # Point this at a 4-class checkpoint to fine-tune.
++  path_pretrained: null
 diff --git a/PointCloudSegmentation/conf/training/default.yaml b/PointCloudSegmentation/conf/training/default.yaml
 index e07724b..7af3899 100644
 --- a/PointCloudSegmentation/conf/training/default.yaml
@@ -56,7 +77,7 @@ index 54b0608..0788b3f 100644
    public: True # It will be display the model within wandb log, else not.
    config:
 diff --git a/PointCloudSegmentation/torch_points3d/datasets/panoptic/treeins_set1.py b/PointCloudSegmentation/torch_points3d/datasets/panoptic/treeins_set1.py
-index 4fe0472..90358b2 100644
+index 4fe0472..fa659cb 100644
 --- a/PointCloudSegmentation/torch_points3d/datasets/panoptic/treeins_set1.py
 +++ b/PointCloudSegmentation/torch_points3d/datasets/panoptic/treeins_set1.py
 @@ -18,12 +18,14 @@ from torch_points3d.models.panoptic.ply import read_ply, write_ply
@@ -93,7 +114,7 @@ index 4fe0472..90358b2 100644
  
  
  ################################### UTILS #######################################
-@@ -102,20 +105,27 @@ def to_ins_ply(pos, label, file):
+@@ -102,20 +105,31 @@ def to_ins_ply(pos, label, file):
  
  # @Treeins: added parameter output_file_name because we now save several final evaluation files because we have several test files
  def final_eval(pre_sem, pre_ins_offset, pos, gt_sem, gt_ins, output_file_name):
@@ -108,7 +129,11 @@ index 4fe0472..90358b2 100644
 -    NUM_CLASSES_sem = 6
 -    NUM_CLASSES_count = 5  # @Treeins: 2 classes without unclassified
 +    NUM_CLASSES_sem = 5
-+    NUM_CLASSES_count = 5  # @Treeins: 2 classes without unclassified  (unused upstream)
++    # Unused in THIS copy of final_eval (mIoU below divides by len(sem_classcount_final)
++    # instead), but the sibling copies do `sum(iou_list) / NUM_CLASSES_count` -- see
++    # treeins.py:187 and npm3d_4class.py:186. Keeping a stale 5 here would silently
++    # divide the headline metric by the wrong number the moment anyone copies that line.
++    NUM_CLASSES_count = 4  # @Treeins: semantic classes excluding unclassified
      # class index for instance segmenatation
      ins_classcount = [2]  # @Treeins
      # class index for stuff segmentation
@@ -157,7 +182,7 @@ index da8e53f..5242246 100644
      ]
  )
 diff --git a/PointCloudSegmentation/train.py b/PointCloudSegmentation/train.py
-index c7cbd87..7b972cb 100644
+index c7cbd87..a0c1da2 100644
 --- a/PointCloudSegmentation/train.py
 +++ b/PointCloudSegmentation/train.py
 @@ -3,17 +3,22 @@ from hydra.core.global_hydra import GlobalHydra
@@ -180,7 +205,7 @@ index c7cbd87..7b972cb 100644
 +    
      trainer = Trainer(cfg)
 +    print(Trainer)
-+    debugpy.breakpoint()   # add — process-initiated stop, ignores pathMappings
++    # debugpy.breakpoint()   # add — process-initiated stop, ignores pathMappings
      trainer.train()
      #
      # # https://github.com/facebookresearch/hydra/issues/440

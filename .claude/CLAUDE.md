@@ -18,10 +18,17 @@ scope; tools for that live in `misc/`).
 - **Stage 1** `pipeline/threedfin.py`: batch-runs the 3DFin v0.6.0 CLI per plot
   (instance segmentation, `<plot>_tree_ID_dist_axes.las`).
 - **Stage 2** `forainet_prep.py` → `pipeline/forainet_prep.py`: centers coordinates
-  (min-subtraction → all ≥ 0), writes ForAINet PLYs + `<plot>_offsets.yml`
+  (min-subtraction → all ≥ 0), writes the training clouds + `<plot>_offsets.yml`
   (shifts + source metadata: format, LAS version/point format/scales, CRS WKT);
   `mode=restore` brings classified PLYs back to original coordinates as LAZ 1.4
   (scales + CRS re-applied, all fields kept as extra-bytes dims).
+  **`output_format` defaults to `laz`**, not ply — see below.
+- **Conversion** `convert.py` → `pipeline/convert.py`: LAZ ↔ PLY, a *pure* format
+  change (no centering/remapping/id-zeroing — those are Stage 2's). Imports only
+  laspy/lazrs/numpy/plyfile/yaml — **no Hydra** — so it runs in the training container:
+  `python -m pipeline.convert --to ply <in> <out>`. `misc/Points2ForAINet.py` is the
+  same CLI under its historic name (its own converter dropped every field but
+  x/y/z/intensity, so it could never write the labels).
 - **Class unifier** `class_unifier.py` → `pipeline/class_unifier.py`: remaps the
   semantic-label column through `class_map: {source: unified}` (many-to-one entries
   merge classes) into a new column (`unified_field`), **drops** the points mapped to
@@ -117,6 +124,15 @@ preprocessed tensors there and will otherwise train on the stale ones.
   `continue_on_error`, `=`-rule summary log line.
 - laspy gotcha: materialise accessors with `np.asarray(...)` (ScaledArrayView /
   SubFieldView are not plain arrays).
+- **PLY is uncompressed** — measured **37.00 bytes/point exactly** (`f8×3+f8+u1+u4`),
+  29.21 GB for the 14 plots vs **4.32 GB as LAZ (6.8×)**. That is why Stage 2 exports
+  LAZ to `paths.export` and the PLY expansion happens on the rented GPU. Ratios track
+  the *source* scale (LAZ compresses integer deltas): 1e-07 → ~4×, 1e-06 → ~8×,
+  1e-05 → 11.9×. Scales are kept per-plot from `<plot>_offsets.yml`, so the export is
+  bit-exact; round trip verified as bit-identical labels/ids/intensity and 3.6e-15 m on
+  coordinates. **Changing `output_format` alone is a footgun** — `ply` belongs in
+  `paths.forainet_raw` (ForAINet globs `raw/**/*.ply`), anything else in `paths.export`;
+  Stage 2 warns when they are mismatched.
 - **Intermediates are transient.** The chain deletes each plot's 3DFin `.las` once
   Stage 2 has succeeded for that plot — only point clouds, never `3dfin_log.txt`, never
   when Stage 2 is absent from `stages`, never after a failure (the retry must not cost

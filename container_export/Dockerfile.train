@@ -1,0 +1,51 @@
+# Thin layer on top of the existing `for-ai-net` image.
+#
+# This is NOT a rebuild. Docker reuses every layer of the base as-is, so the steps that
+# can no longer be reproduced -- MinkowskiEngine from git master, torchsparse, the
+# hdbscan master.zip -- never run again. Only the layers below are new, and they take
+# seconds.
+#
+#   docker build -f Dockerfile.train -t <user>/for-ai-net:v1 .
+#   docker push <user>/for-ai-net:v1
+#
+# Base image facts that shaped this file (verified against its Dockerfile):
+#   * Python 3.8.10
+#   * laspy==2.0.3 and NO LAZ backend -- it physically cannot open the .laz export
+#   * hydra-core==1.0.7, no hydra-zen -- so the repo's Hydra entry scripts cannot run
+#     here; the argparse CLI below is the supported path
+#   * TORCH_CUDA_ARCH_LIST 6.0;7.0;7.5;8.0;8.6 with no +PTX -> rent P100/V100/T4/
+#     A100/A10/A40/RTX3090. NOT 4090, L40S, H100 or Blackwell: no kernels, no JIT
+#     fallback.
+
+ARG BASE=for-ai-net
+FROM ${BASE}
+
+# The LAZ backend the base never had, plus a laspy new enough for header.parse_crs.
+# numpy is pinned to the version already in the image so pip cannot drag the torch
+# stack sideways while resolving. laspy is pure Python; lazrs ships manylinux wheels.
+RUN python3.8 -m pip install --no-cache-dir "laspy[lazrs]" "numpy==1.24.4"
+
+# The converter. /opt/prep stays off /workspace so the latter remains an exact mirror
+# of the local bind mount.
+COPY pipeline/ /opt/prep/pipeline/
+COPY misc/     /opt/prep/misc/
+ENV PYTHONPATH=/opt/prep
+
+# Fail here, on your laptop, rather than on a rented GPU with the data downloaded.
+COPY smoke_test.py /tmp/smoke_test.py
+RUN python3.8 /tmp/smoke_test.py
+
+WORKDIR /workspace/PointCloudSegmentation
+
+# Usage inside the container, once the .laz export has been fetched to /data/export:
+#
+#   python3.8 -m pipeline.convert --to ply /data/export \
+#       /workspace/PointCloudSegmentation/data_set1_5classes/treeinsfused/raw/SegmentedForests
+#
+# The file stem is preserved on purpose: ForAINet reads the train/val/test split from
+# the file NAME (name[-7:-4]=="val", then name[-8:-4]=="test"), so plot_11_val.laz must
+# become plot_11_val.ply. A prefix or a rename silently moves a plot between sets.
+#
+# Then train, remembering that conf/config.yaml defaults to `training: ablation_area4_set2`:
+#
+#   python3.8 train.py training=treeins_set1 ...

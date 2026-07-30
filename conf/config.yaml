@@ -10,6 +10,7 @@ paths:
   forainet_dataroot: ${paths.forainet}\data_set1_5classes
   forainet_raw: ${paths.forainet_dataroot}\treeinsfused\raw\SegmentedForests   # ForAINet globs this; not a free choice
   offsets: ${paths.assignment}\SegmentedForests\ForAINet_input                 # small, tracked, makes restore possible
+  export: ${paths.assignment}\SegmentedForests\ForAINet_export                 # Stage 2 LAZ export, ready to upload
 
 # --- Label scheme, shared by class_unifier and forainet_prep -----------------
 # Edit here, not on the CLI: the integer keys break Hydra overrides (see README).
@@ -93,12 +94,13 @@ class_unifier:
   memory_budget_frac: 0.7
   bytes_per_point: 140                 # measured peak RSS per point
 
-# --- Stage 2: center + write ForAINet PLYs / restore — python forainet_prep.py
+# --- Stage 2: center + write the training clouds / restore — python forainet_prep.py
 forainet_prep:
   mode: preprocess                     # preprocess | restore
   input_dir:  ${paths.assignment}\SegmentedForests\3DFin_output
   patterns: ["*.las", "*.laz", "*.ply"]
-  output_dir: ${paths.forainet_raw}
+  output_dir: ${paths.export}
+  output_format: laz                   # laz | las | ply — ply is ~7x bigger; pair ply with output_dir: ${paths.forainet_raw}
   semantic_field: ${classes.semantic_field}
   tree_id_field: ${classes.tree_id_field}
   intensity_field: null                # null = auto-detect
@@ -111,6 +113,24 @@ forainet_prep:
   restore_dir: null                    # required for mode=restore
   offsets_dir: ${paths.offsets}        # where <plot>_offsets.yml live, in BOTH modes
   restore_format: laz                  # laz | las | ply
+  plots: null
+  overwrite: true
+  dry_run: false
+  continue_on_error: true
+  workers: null
+  memory_budget_frac: 0.7
+  bytes_per_point: 140
+
+# --- Format conversion (optional) — python convert.py -----------------------
+# Expands the LAZ export back into the PLYs ForAINet reads. Normally run INSIDE the
+# training container, where there is no Hydra:
+#   python -m pipeline.convert --to ply /data/export /workspace/.../raw/SegmentedForests
+convert:
+  input_dir:  ${paths.export}
+  output_dir: ${paths.forainet_raw}
+  to: ply                              # ply | laz | las — files already in this format are skipped
+  patterns: ["*.laz", "*.las", "*.ply"]
+  offsets_dir: ${paths.offsets}        # only read when writing LAS/LAZ from a PLY (scales + CRS)
   plots: null
   overwrite: true
   dry_run: false

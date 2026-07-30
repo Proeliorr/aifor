@@ -1,0 +1,28 @@
+# Second guard on the build context. The staging copy is already the filter, so this
+# exists to stop anything that appears here LATER from silently entering the image --
+# most importantly point clouds (the data comes from object storage at runtime, never
+# from the image) and Hydra run directories, which reached 627 MB in the source tree.
+
+# Point clouds — never in the image
+*.laz
+*.las
+*.ply
+*.npy
+
+# Hydra / training run output
+outputs/
+wandb/
+multirun/
+
+# Python bytecode: the source tree carries 533 stale .pyc files compiled by a
+# different interpreter than this image's Python 3.8.10.
+__pycache__/
+*.pyc
+*.pyo
+
+# Local tooling that has no business in a training image
+.git/
+.vscode/
+.venv/
+*.ipynb
+.ipynb_checkpoints/

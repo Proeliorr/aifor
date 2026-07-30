@@ -20,11 +20,16 @@ entry script reading its own section of the shared `conf/config.yaml`:
 The development history — what was added when and why — is tracked in
 [`docs/progress.md`](docs/progress.md).
 
-> The sibling [`ForAINet/`](ForAINet/readme.md) folder is the **deep-learning framework**
-> this pipeline feeds (panoptic point-cloud segmentation) — a pinned git submodule of
-> [prs-eth/ForAINet](https://github.com/prs-eth/ForAINet), documented upstream. Get it with
-> `git submodule update --init`; our local edits to it live in
-> [`patches/forainet-local.patch`](patches/README.md).
+> The sibling `ForAINet/` folder is the **deep-learning framework** this pipeline feeds
+> (panoptic point-cloud segmentation) — a pinned git submodule of
+> [prs-eth/ForAINet](https://github.com/prs-eth/ForAINet). Get it with
+> `git submodule update --init`. Our own analysis of it is in
+> [`docs/ARCHITECTURE_ANALYSIS.md`](docs/ARCHITECTURE_ANALYSIS.md) (the model and data
+> pipeline), [`docs/train_logs_explained.md`](docs/train_logs_explained.md) (a training
+> run, line by line) and [`docs/eval_process.md`](docs/eval_process.md) (evaluation and
+> every metric it reports). Our local edits to the submodule live in
+> [`patches/forainet-local.patch`](patches/README.md) — verify they are still applied with
+> `python misc/check_forainet_classes.py`.
 
 > **Project scope.** The main approach here is **semantic segmentation resolved at
 > whole-plot level**, so the pipeline stops at the plot-level 3DFin output. Standalone
@@ -232,9 +237,18 @@ mamba run -n aifor python main_pipeline.py
 ```
 
 That takes the unprocessed clouds in `SegmentedForests/pointclouds/` all the way to the
-PLYs ForAINet trains on, **one plot at a time**: 3DFin, then Stage 2, then the plot's
-3DFin `.las` is deleted because nothing needs it any more. Add `chain.dry_run=true`
-first to see the plan (and each 3DFin command) without writing anything.
+training clouds, **one plot at a time**: 3DFin, then Stage 2, then the plot's 3DFin
+`.las` is deleted because nothing needs it any more. Add `chain.dry_run=true` first to
+see the plan (and each 3DFin command) without writing anything.
+
+The result is **LAZ** in `SegmentedForests/ForAINet_export/` — **4.32 GB against 29.21 GB
+of PLY, measured over all 14 plots** — and ready to upload. To train on this machine
+instead, ask for PLY straight into ForAINet's data folder:
+
+```bash
+mamba run -n aifor python main_pipeline.py \
+    forainet_prep.output_format=ply forainet_prep.output_dir='${paths.forainet_raw}'
+```
 
 ### Why it works plot by plot
 
@@ -268,10 +282,11 @@ need:
 
 | Run | Requires on disk | Produces | Disk |
 |---|---|---|---|
-| `python main_pipeline.py` | `pointclouds/*.laz` + `3DFin_settings/*.ini` | training PLYs + `<plot>_offsets.yml` | ≤15 GB transient, ~25 GB kept |
+| `python main_pipeline.py` | `pointclouds/*.laz` + `3DFin_settings/*.ini` | LAZ export + `<plot>_offsets.yml` | ≤15 GB transient, 4.3 GB kept |
 | `python main_pipeline.py chain.stages=[threedfin]` | same | `3DFin_output/<plot>/*.las` (nothing deleted) | 46 GB |
-| `python main_pipeline.py chain.stages=[forainet_prep]` | `3DFin_output/**/*.las` | training PLYs + offsets, **consuming** the `.las` | frees 46 GB |
-| `python forainet_prep.py` | `3DFin_output/**/*.las` | training PLYs + offsets, keeping the `.las` | ~25 GB |
+| `python main_pipeline.py chain.stages=[forainet_prep]` | `3DFin_output/**/*.las` | LAZ export + offsets, **consuming** the `.las` | frees 46 GB |
+| `python forainet_prep.py` | `3DFin_output/**/*.las` | LAZ export + offsets, keeping the `.las` | 4.3 GB |
+| `python convert.py` | the LAZ export | the PLYs ForAINet trains on | 29.2 GB |
 | `python class_unifier.py` | `3DFin_output/**/*.las` | diagnostic PLYs (source + unified labels side by side) | ~25 GB |
 | `python forainet_prep.py forainet_prep.mode=restore forainet_prep.restore_dir=…` | classified PLYs + `<plot>_offsets.yml` | `restored_<plot>.laz` in original coordinates | — |
 
@@ -283,7 +298,7 @@ goes, the standalone form runs several at once (memory-budgeted) and keeps every
 
 ```bash
 # Resume an interrupted run: chain.overwrite is false by default, so plots whose
-# training PLY already exists are skipped without re-running 3DFin.
+# training cloud already exists are skipped without re-running 3DFin.
 mamba run -n aifor python main_pipeline.py
 
 # Redo one plot from scratch
@@ -309,6 +324,56 @@ Nothing is deleted unless `forainet_prep` is in `stages` **and** it reported tha
 succeeded. A failure leaves the expensive `.las` in place, so the retry costs minutes.
 
 The keys are in [Configuration reference → `chain:`](#chain--which-stages-run-and-what-survives).
+
+### Training on a rented GPU
+
+This is why Stage 2 exports LAZ. A binary PLY is an uncompressed memory dump, so the
+clouds ForAINet reads are **29.21 GB against 4.32 GB for the same points as LAZ** —
+6.8× measured over all 14 plots — and on a rented machine every one of those bytes
+crosses a network you are paying for and waiting on. The export travels compressed and
+is expanded on the GPU box, where the disk is already rented and the conversion takes
+seconds (14 plots in ~2 minutes).
+
+```
+LOCAL                                  object store              GPU INSTANCE
+main_pipeline.py                                                 python -m pipeline.convert \
+  3DFin -> Stage 2 -> plot_XX_<split>.laz  ---- upload ---->        --to ply <in> <raw/>
+                    + plot_XX_offsets.yml                                    |
+                                                                             v
+                                                              ForAINet trains on raw/**/*.ply
+```
+
+1. **Export.** `mamba run -n aifor python main_pipeline.py` → `SegmentedForests/ForAINet_export/`.
+2. **Bundle**, if you would rather push one object than fifteen. LAZ is already
+   compressed, so use a plain tar — a zip would only re-pack it:
+   `tar -cf export.tar *.laz *_offsets.yml`
+3. **Upload** to object storage, and push your training image to a registry.
+4. **On the instance**, pull both, then convert and train:
+   ```bash
+   python -m pipeline.convert --to ply /data/export \
+       /workspace/PointCloudSegmentation/data_set1_5classes/treeinsfused/raw/SegmentedForests
+   ```
+5. **Retrieve the checkpoints and predictions** — not the data. See below.
+
+Four things that will bite otherwise:
+
+- **Allocate ≥60 GB of instance disk.** The LAZ expands to ~29 GB of PLY, ForAINet then
+  builds a ~2 GB tensor cache in `processed_0.2/`, and checkpoints land on top. Running
+  out mid-preprocessing looks like a framework crash.
+- **Check CUDA compatibility before renting.** `ForAINet/` is pinned at `5fe600a` with
+  older `torch-points3d`/`torch-scatter` builds, which will not compile against the
+  newest GPU architectures. Filter by a generation your image actually supports.
+- **Never bake credentials into the image** — it goes to a registry. Pass storage keys as
+  environment variables on the instance.
+- **Ship the `<plot>_offsets.yml` files with the export.** They are a few KB each and are
+  the only thing that can put predictions back into real-world coordinates.
+
+**Do not download the training data afterwards.** Those clouds contain no original
+information — every byte is derived from the 4.4 GB of source LAZ plus this repo. What is
+irreplaceable is the **checkpoint**, the run config and logs, and the **predictions on
+val/test**, which `forainet_prep.py forainet_prep.mode=restore` turns back into
+georeferenced LAZ. `processed_0.2/` is a cache: never upload it, never retrieve it, and
+**delete it locally whenever `raw/` changes** or ForAINet will train on the stale one.
 
 ---
 
@@ -362,7 +427,8 @@ several deep. Lower `memory_budget_frac` if other work is competing for memory; 
 |---|---|
 | `assignment` | This repository's root. Every other path is built from it, so on another machine this is usually the only line to change. |
 | `forainet` / `forainet_dataroot` | The ForAINet submodule checkout and the dataset root inside it. |
-| `forainet_raw` | Where Stage 2 writes the clouds ForAINet trains on. |
+| `forainet_raw` | Where ForAINet looks for the PLYs it trains on. |
+| `export` | Where Stage 2 writes its LAZ export — the folder you upload. |
 | `offsets` | Where the `<plot>_offsets.yml` files live — deliberately outside the submodule. |
 
 **`forainet_raw` is not a free choice.** ForAINet assembles that path itself and then
@@ -502,16 +568,66 @@ chain, from this same section. Plus the [shared run-control](#keys-every-stage-h
 
 | Key | Default | What it does |
 |---|---|---|
-| `mode` | `preprocess` | `preprocess` = input clouds → centered PLYs + `<plot>_offsets.yml`; `restore` = classified PLYs → original coordinates. |
+| `mode` | `preprocess` | `preprocess` = input clouds → centered training clouds + `<plot>_offsets.yml`; `restore` = classified PLYs → original coordinates. |
 | `input_dir` / `patterns` | `…/3DFin_output`, all three extensions | Preprocess input, same two-layout matching as `class_unifier`. Narrow `patterns` to `["*_tree_ID_dist_axes.las"]` when a plot folder holds more than one matching cloud (e.g. `prune_outputs: false`). |
-| `output_dir` | `${paths.forainet_raw}` | The PLYs go straight where ForAINet globs for them — no copy step, and no chance of training on a stale copy. |
+| `output_dir` | `${paths.export}` | Where the training clouds land. Pair with `output_format`: the LAZ export goes to `${paths.export}` and is uploaded; a `ply` run belongs in `${paths.forainet_raw}`, where ForAINet globs for it. |
+| `output_format` | `laz` | `laz` (default), `las` or `ply` — the container only; the points are identical. **A binary PLY is an uncompressed memory dump** (measured 37.00 B/pt; 29.21 GB against 4.32 GB of LAZ over the 14 plots), so the default keeps the upload to a rented GPU small. ForAINet reads PLY only — see [`convert:`](#convert--laz--ply-optional). |
 | `semantic_field` / `tree_id_field` / `intensity_field` | from `classes:`, `null` | As in `class_unifier:` above. |
 | `class_map` / `drop_value` | from `classes:` | The PLYs written here are what ForAINet trains on, so they carry the unified labels; without this the framework would see the raw source classes. |
 | `instance_classes` | from `classes:` | Points outside these classes get tree id 0 — see the note above. |
-| `split` | `{n_val: 1, n_test: 2}` | Appends `_train`/`_val`/`_test` to each PLY name, which is the only way ForAINet learns what a cloud is for. Each value is a count (int) or a fraction of the plots (float < 1). `null` writes plain `<plot>.ply`. See [Train / val / test](#train--val--test--carried-by-the-file-name). |
+| `split` | `{n_val: 1, n_test: 2}` | Appends `_train`/`_val`/`_test` to each file name, which is the only way ForAINet learns what a cloud is for. Each value is a count (int) or a fraction of the plots (float < 1). `null` writes a plain `<plot>` name. See [Train / val / test](#train--val--test--carried-by-the-file-name). |
 | `restore_dir` | `null` | Restore only: folder of classified `*.ply` to restore. **Required** for `mode=restore`; files already named `restored_*` are ignored. |
 | `offsets_dir` | `${paths.offsets}` | Where `<plot>_offsets.yml` live, in **both** modes. `null` = beside the clouds. |
 | `restore_format` | `laz` | `laz` = compressed LAS 1.4 with the source scales and CRS re-applied and every extra field kept as an extra-bytes dimension; `las` = the same, uncompressed; `ply` = plain PLY. |
+
+### `convert:` — LAZ ↔ PLY (optional)
+
+Run with `python convert.py` (engine: [`pipeline/convert.py`](pipeline/convert.py)).
+Expands the LAZ export back into the PLYs ForAINet reads. Plus the
+[shared run-control](#keys-every-stage-has) and
+[parallelism](#keys-the-parallel-stages-have) keys.
+
+| Key | Default | What it does |
+|---|---|---|
+| `input_dir` | `${paths.export}` | Folder of clouds to convert, matched flat and one level down. |
+| `output_dir` | `${paths.forainet_raw}` | Destination. `null` writes beside the inputs. |
+| `to` | `ply` | Target format — `ply`, `laz` or `las`. Files already in that format are skipped, so a second run is a no-op rather than a corruption. |
+| `patterns` | `["*.laz", "*.las", "*.ply"]` | Globs to match. |
+| `offsets_dir` | `${paths.offsets}` | Only consulted when writing **LAS/LAZ from a PLY**, to recover the source scales and CRS that a PLY cannot carry. |
+
+This is a **pure format conversion** — no centring, no class remapping, no tree-id
+zeroing. All of that already happened in Stage 2, whose output carries centred
+coordinates (LAS header offset 0), the unified `semantic_seg` and the zeroed `treeID`.
+Everything that changes what the model learns stays in the pipeline; this stage only
+moves bytes between containers.
+
+**The file stem is preserved**, and that is load-bearing: `plot_11_val.laz` becomes
+`plot_11_val.ply`, because ForAINet reads the split from the file *name*. A prefix or a
+rename silently moves a plot between train and test.
+
+Inside a training container there is no Hydra, so use the engine's own CLI — it imports
+only `laspy`, `lazrs`, `numpy`, `plyfile` and `PyYAML`:
+
+```bash
+python -m pipeline.convert --to ply /data/export \
+    /workspace/PointCloudSegmentation/data_set1_5classes/treeinsfused/raw/SegmentedForests
+```
+
+[`misc/Points2ForAINet.py`](misc/Points2ForAINet.py) is the same CLI under its historic
+name, runnable straight from a checkout.
+
+**Fidelity, measured on plot_11** (18,945,417 points, round trip PLY → LAZ → PLY):
+`semantic_seg`, `treeID` and `intensity` come back **bit-identical** — the labels travel
+as LAS extra-bytes dimensions — and the largest coordinate deviation is
+**3.6 × 10⁻¹⁵ m**, i.e. float64 rounding, because the centred coordinates already sit
+exactly on the source 1e-07 grid. The model voxelises at 0.2 m.
+
+> **If you ever need the export smaller still, the lever is the coordinate scale.** LAZ
+> compresses the *integer* coordinate deltas, and the export inherits each plot's source
+> scale. That is visible in the measured ratios: the plots stored at 1e-07 compress
+> ~4×, those at 1e-06 ~8×, and plot_13 at 1e-05 reaches **11.9×**. A 1 mm scale would put
+> every plot in that range — still 200× finer than the model's grid — at the cost of no
+> longer being bit-exact against the source coordinates.
 
 ---
 

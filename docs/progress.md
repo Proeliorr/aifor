@@ -431,6 +431,94 @@ Dates follow the Hydra run logs in `outputs/<date>/<time>/`.
   via a `class_map` key" note survived long after that shipped; and two links pointed at
   `progress.md` and a `ForAINet/ARCHITECTURE_ANALYSIS.md` that no longer exist.
 
+## 2026-07-30 — Stage 2 exports LAZ; conversion to PLY moves into the training container
+
+- **Why.** Training moves to a rented GPU, so the clouds have to be uploaded — and a
+  binary PLY is an uncompressed memory dump. Measured: `plot_11_val.ply` is **668.5 MB =
+  exactly 37.00 bytes/point** (`f8×3 + f8 + u1 + u4`), and the 14 plots come to
+  **29.21 GB from 4.41 GB of source**. Every one of those bytes would have crossed the
+  network.
+- **`forainet_prep.output_format`** (`laz` | `las` | `ply`, default **`laz`**) reuses the
+  `_write_las` the restore path has always used, so the labels travel as LAS extra-bytes
+  dimensions and the source scales and CRS are re-applied. New `paths.export`
+  (`SegmentedForests/ForAINet_export`) is the new `output_dir` default; `output_format=ply`
+  paired with `${paths.forainet_raw}` reproduces the old behaviour exactly.
+- **Measured over all 14 plots: 29.21 GB → 4.32 GB, 6.8×, saving 24.9 GB of upload.**
+  Per-plot ratios run 4.0× to 11.9× and track the source coordinate scale, because LAZ
+  compresses integer deltas: the 1e-07 plots reach ~4×, 1e-06 ~8×, and plot_13 at 1e-05
+  hits 11.9×. Kept the source scales rather than quantising, so the export stays bit-exact
+  against the source coordinates.
+- **`pipeline/convert.py`** — new, and deliberately dependency-light: `laspy`, `lazrs`,
+  `numpy`, `plyfile`, `yaml` and stdlib, **no Hydra**, verified by asserting nothing from
+  `hydra`/`omegaconf`/`torch` enters `sys.modules` on import. Runs as
+  `python -m pipeline.convert --to ply <in> <out>` in the container, as `python convert.py`
+  through the new `convert:` config section, or via `misc/Points2ForAINet.py`.
+- **It is a pure format conversion** — no centring, no class remapping, no tree-id zeroing.
+  All of that stays in Stage 2, whose output already carries centred coordinates (LAS
+  header offset 0), the unified `semantic_seg` and the zeroed `treeID`. The **file stem is
+  preserved**, which is load-bearing: ForAINet reads the split from the file name, so
+  `plot_11_val.laz → plot_11_val.ply` and a prefix would silently move a plot between sets.
+- **Round trip verified on plot_11** (18.9 M points): `semantic_seg`, `treeID` and
+  `intensity` **bit-identical**; largest coordinate deviation **3.6e-15 m** — float64
+  rounding, not quantisation, because the centred coordinates already sat exactly on the
+  1e-07 grid. The `output_format=ply` path still produces a byte-identical file (SHA-256).
+- **`misc/Points2ForAINet.py` rewritten as a thin CLI** over `pipeline.convert`. Its own
+  `array_to_las` wrote only `x/y/z/intensity`, so it would have **silently discarded
+  `semantic_seg` and `treeID`** — it could never have done this job. The `dummy_`/
+  `restored_` prefixes and the path-keyed `offset.yml` retire with it.
+- Knock-on fixes: the `overwrite` skip, the stale-sibling sweep (now covering every split
+  **and** every format, so switching format cannot strand a `.ply` beside a new `.laz`) and
+  the chain's resume check are all extension-aware; `<plot>_offsets.yml` gains
+  `output_file` alongside the legacy `ply_file`; and Stage 2 warns if a non-PLY export is
+  written into a ForAINet `raw/` tree, which globs `*.ply` only and would train on nothing.
+
+## 2026-07-31 — Finished the 4-class conversion; documented the evaluation path
+
+- **Why now.** `docs/train_logs.md` is from 2026-07-21 and shows
+  `iou_per_class = {0,1,2,3,4}` — **five** classes. The 5→4 patch landed on 2026-07-27, so
+  the patched pipeline had never actually been run. Finding that out on a rented GPU would
+  be expensive.
+- **Audit result: the conversion was functionally complete but had two loose ends.**
+  `dataset.num_classes` is the single source (`segmentation/treeins_set1.py:211`), read by
+  the model head (`PointGroup3heads.py:80`) and the tracker (`self._num_classes`), so
+  nothing structural was wrong. The two artefacts still saying "5":
+  - `NUM_CLASSES_count = 5` in `panoptic/treeins_set1.py` — dead in *that* copy, but the
+    sibling copies do `mIoU = sum(iou_list) / NUM_CLASSES_count` (`treeins.py:187`,
+    `npm3d_4class.py:186`). A wrong value in a variable that elsewhere divides the headline
+    metric is a copy-paste landmine. Now 4.
+  - `path_pretrained` in `FORpartseg_3heads.yaml` pointed at a **5-class** checkpoint on the
+    author's cluster. Verified from `train_logs.md:11` that it only ever logged *"The path
+    does not exist, it will not load any model"* — every run trained from scratch by
+    accident. And had it resolved, `load_state_dict_with_same_shape(strict=False)`
+    (`base_model.py`) would have **silently skipped** the mismatched 4-vs-5 semantic head.
+    Now `null`, so "from scratch" is a decision.
+- **New `misc/check_forainet_classes.py`** — re-derives all 14 class constants from the
+  `classes:` block of `conf/config.yaml` and checks the submodule against them, by
+  *parsing* the source (no torch needed, runs anywhere). It exists because a submodule
+  stores only a SHA: `git submodule update` reverts the patch, and nothing crashes — the
+  model just grows a fifth output no label can reach while `final_eval` divides by the
+  wrong number. Verified by stashing the patch: the checker reported **12 mismatches**,
+  including `path_pretrained`; re-applying restored a byte-identical tree and it passed.
+- **`patches/forainet-local.patch` regenerated** — 6 files now (the model config joined).
+  `patches/README.md` was claiming three; corrected, with the `.pyc` exclusion the
+  regenerate command needs and a note that untracked files in the submodule are not
+  captured at all.
+- **New `docs/eval_process.md`** — traces `eval.py` (18 lines) through `Trainer.eval` →
+  `_test_epoch` → `tracker.finalise` → `dataset.final_eval`, and defines all 44 statistics
+  the run emits. The points worth knowing: there are **two tiers** of metrics and only
+  `Evaluation_<i>.txt` is reportable (the live tracker numbers are running averages over
+  subsampled cylinders); instance matching is IoU ≥ 0.5; `MUCov` vs `MWCov` is unweighted
+  vs size-weighted, so the gap between them is the small-tree/large-tree story;
+  `PQ = SQ × RQ`, so PQ alone cannot say which half failed; and `final_eval` uses **two
+  numbering schemes twelve lines apart** (1-based with 0 = ignore, plus a binary
+  unclassified/stuff/thing collapse where `NUM_CLASSES = 3`).
+- Also found and documented: `conf/eval.yaml` cannot run as shipped (eleven absolute paths
+  under `/cluster/work/igp_psr/binbin/…`, empty `checkpoint_dir`), and `conf/config.yaml`
+  defaults to `models: panoptic/area4_ablation_2` — **a file that does not exist**, so
+  `models=` must always be overridden.
+- README: restored the pointer to `docs/ARCHITECTURE_ANALYSIS.md`, which a previous
+  link fix had redirected to the submodule's own readme.
+
 ---
 
 ## Planned

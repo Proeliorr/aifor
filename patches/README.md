@@ -10,16 +10,32 @@ instead: versioned in **our** repo, never pushed upstream.
 
 ## `forainet-local.patch`
 
-Adapts upstream to this project. Three files:
+Adapts upstream to this project. **Six files**, of which three carry the class-scheme
+change and are the ones that matter:
 
 | File | Why |
 |---|---|
-| `PointCloudSegmentation/conf/training/default.yaml` | short debug runs (`epochs: 5`, `num_workers: 0`, `batch_size: 4`), our `wandb` entity/project, tensorboard off |
-| `PointCloudSegmentation/conf/training/treeins_set1.yaml` | our `wandb` entity + experiment name (upstream ships the author's `binbin`) |
-| `PointCloudSegmentation/train.py` | `import debugpy` + `debugpy.breakpoint()` for container debugging |
+| `torch_points3d/datasets/segmentation/treeins_set1.py` | **5 → 4 classes.** `Treeins_NUM_CLASSES`, `INV_OBJECT_LABEL`, `OBJECT_COLOR` — upstream's class 4 `branches` has no SegmentedForests counterpart, so nothing can ever map to it |
+| `torch_points3d/datasets/panoptic/treeins_set1.py` | the same table again (it is declared twice), plus `VALID_CLASS_IDS`, `SemIDforInstance`, and the `final_eval` counters `NUM_CLASSES_sem`, `NUM_CLASSES_count`, `sem_classcount`, `thing_classes` |
+| `conf/models/panoptic/FORpartseg_3heads.yaml` | `path_pretrained: null` — upstream points it at a **5-class** checkpoint on the author's cluster (see below) |
+| `conf/training/treeins_set1.yaml` | our `wandb` entity + experiment name (upstream ships the author's `binbin`) |
+| `conf/training/default.yaml` | short debug runs (`epochs: 5`, `num_workers: 0`, `batch_size: 4`), our `wandb` entity/project, tensorboard off |
+| `train.py` | `import debugpy` + `debugpy.breakpoint()` for container debugging |
+
+**Why `path_pretrained` had to go.** It named a checkpoint trained with five classes.
+The path does not exist here, so every run so far logged *"The path does not exist, it
+will not load any model"* (`base_model.py:154`) and trained from scratch **by accident**.
+Worse, if the path ever resolved, `load_state_dict_with_same_shape(m, strict=False)`
+silently skips layers whose shape changed — our semantic head is 4-wide, that one is
+5-wide, so the head would be dropped without a word and you would believe you were
+fine-tuning. `null` makes "from scratch" a decision.
 
 `num_workers: 0` matters on Windows/Docker: DataLoader workers pass batches through
 `/dev/shm`, which is why `docker-compose.yml` also raises `shm_size`.
+
+> **The `train.py` breakpoint is for local debugging only.** `debugpy.breakpoint()` sits
+> immediately before `trainer.train()`. Strip or guard it before baking a training image
+> — it has no place on a rented GPU with no debugger attached.
 
 ## Reapply after a fresh clone / submodule reset
 
@@ -29,20 +45,32 @@ cd ForAINet
 git apply ../patches/forainet-local.patch
 ```
 
-Check it worked — exactly these three files should be modified, nothing else:
+Then **verify it, rather than trusting it** — a reverted patch does not crash anything,
+it just trains a 5-class head on 4-class data and divides the metrics by the wrong
+number:
 
 ```bash
-git -C ForAINet status --porcelain | grep -v '^??'
+python misc/check_forainet_classes.py        # exits non-zero on any mismatch
 ```
+
+That script re-derives what ForAINet should contain from the `classes:` block of
+`conf/config.yaml` and parses the submodule to confirm. It reads the source rather than
+importing it, so it needs no torch and runs anywhere. Run it after every submodule
+operation, and before building a training image.
 
 ## Regenerate the patch after changing something in ForAINet/
 
 ```bash
 cd ForAINet
-git diff -- PointCloudSegmentation/conf/training/default.yaml \
-            PointCloudSegmentation/conf/training/treeins_set1.yaml \
-            PointCloudSegmentation/train.py > ../patches/forainet-local.patch
+git diff -- . ':(exclude)*.pyc' > ../patches/forainet-local.patch
 ```
+
+The `.pyc` exclusion is essential: upstream commits bytecode (see below), so a bare
+`git diff` sweeps ~115 recompiled `.pyc` files into the patch.
+
+**Untracked files are not captured.** `git diff` only sees tracked changes, so anything
+you created inside `ForAINet/` (e.g. `omegatest.py`) lives nowhere but your disk. Copy it
+into this repo if it matters.
 
 Write it with a tool that does **not** add a UTF-8 BOM — PowerShell's
 `Out-File -Encoding utf8` does, and `git apply` then rejects the file. The shell

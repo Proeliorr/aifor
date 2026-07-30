@@ -1,4 +1,4 @@
-r"""Chained driver: unprocessed clouds -> ForAINet training PLYs, one plot at a time.
+r"""Chained driver: unprocessed clouds -> ForAINet training clouds, one plot at a time.
 
 Why this exists
 ---------------
@@ -8,8 +8,8 @@ read a single one. Nothing needs those files once Stage 2 has consumed them, so 
 whole 46 GB is dead weight the moment it is written.
 
 This module runs the same two engines **per plot** and deletes each 3DFin ``.las`` as
-soon as Stage 2 has successfully turned it into a training PLY. The transient cost drops
-from all fourteen files at once to the largest single one (15.2 GB, plot_08).
+soon as Stage 2 has successfully turned it into a training cloud. The transient cost
+drops from all fourteen files at once to the largest single one (15.2 GB, plot_08).
 
 3DFin is an external command-line program: it can only hand over its result as a file,
 so there is no way to avoid writing that file. Consuming it immediately is the next
@@ -168,6 +168,9 @@ def run_chain(
     stage1_out = Path(threedfin["output_dir"])
     prep_in = Path(forainet_prep["input_dir"])
     prep_out = Path(forainet_prep["output_dir"])
+    # Stage 2 writes LAZ by default (a PLY is ~7x bigger and has to be uploaded to the
+    # rented GPU), so the resume check below cannot assume an extension.
+    prep_ext = str(forainet_prep.get("output_format") or "laz").lower().lstrip(".")
 
     if not src_dir.is_dir():
         raise NotADirectoryError(f"threedfin.pointclouds_dir does not exist: {src_dir}")
@@ -237,12 +240,12 @@ def run_chain(
         plot = src.stem
         which = split_of.get(plot)
         stage1_las = stage1_out / plot / f"{plot}{_INPUT_SUFFIX}.las"
-        out_ply = prep_out / (f"{plot}_{which}.ply" if which else f"{plot}.ply")
+        out_cloud = prep_out / f"{f'{plot}_{which}' if which else plot}.{prep_ext}"
 
         # --- resume: is this plot already done? ---------------------------
         # The last stage in the chain owns the answer, so an interrupted run picks up
         # where it stopped instead of repeating hours of 3DFin.
-        final_output = out_ply if run_prep else stage1_las
+        final_output = out_cloud if run_prep else stage1_las
         if not overwrite and final_output.exists():
             log.info("[%s] %s already exists and overwrite=False — skipping", plot, final_output.name)
             skipped.append(plot)
@@ -253,7 +256,7 @@ def run_chain(
             if run_3dfin:
                 steps.append(f"3DFin {src.name} => {stage1_las.name}")
             if run_prep:
-                steps.append(f"Stage 2 => {out_ply.name} (+ {plot}_offsets.yml)")
+                steps.append(f"Stage 2 => {out_cloud.name} (+ {plot}_offsets.yml)")
                 if not _keeps(keep_intermediates, plot):
                     steps.append(f"delete {stage1_las.name}")
             log.info("[%s] DRY RUN: %s", plot, " -> ".join(steps))
@@ -291,7 +294,7 @@ def run_chain(
             )
             if plot not in result["succeeded"]:
                 log.error("[%s] Stage 2 did not produce %s — the 3DFin output is KEPT so "
-                          "this can be retried without re-running 3DFin", plot, out_ply.name)
+                          "this can be retried without re-running 3DFin", plot, out_cloud.name)
                 (skipped if plot in result["skipped"] else failed).append(plot)
                 if not continue_on_error:
                     log.error("continue_on_error=False — stopping after first failure.")

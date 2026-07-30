@@ -80,6 +80,9 @@ module because `class_unifier` imports the reader from `forainet_prep`, so
 Config pattern: one shared `conf/config.yaml`, one section per stage
 (`chain:`, `threedfin:`, `class_unifier:`, `forainet_prep:`), one hydra-zen entry script
 per stage. Override keys with the section prefix: `forainet_prep.plots=[plot_02]`.
+**`config.yaml` is a settings file, not a design document** — it holds values plus at most
+a one-line hint. Every key is explained in README's *Configuration reference*; put new
+rationale there, not back in the YAML (it was 366 lines and unusable before the split).
 `main_pipeline.py` is the exception — the chain needs three sections at once, and `zen()`
 maps a *single* section onto a function, so it converts the config itself
 (`OmegaConf.to_container(cfg, resolve=True)`).

@@ -18,11 +18,13 @@ entry script reading its own section of the shared `conf/config.yaml`:
   the PLYs ForAINet trains on.
 
 The development history — what was added when and why — is tracked in
-[`progress.md`](progress.md).
+[`docs/progress.md`](docs/progress.md).
 
-> The sibling `ForAINet/` folder is a **separate, deep-learning** approach to the same forest
-> problem (panoptic point-cloud segmentation). It is unrelated to this batch runner and is
-> documented on its own in [`ForAINet/ARCHITECTURE_ANALYSIS.md`](ForAINet/ARCHITECTURE_ANALYSIS.md).
+> The sibling [`ForAINet/`](ForAINet/readme.md) folder is the **deep-learning framework**
+> this pipeline feeds (panoptic point-cloud segmentation) — a pinned git submodule of
+> [prs-eth/ForAINet](https://github.com/prs-eth/ForAINet), documented upstream. Get it with
+> `git submodule update --init`; our local edits to it live in
+> [`patches/forainet-local.patch`](patches/README.md).
 
 > **Project scope.** The main approach here is **semantic segmentation resolved at
 > whole-plot level**, so the pipeline stops at the plot-level 3DFin output. Standalone
@@ -44,7 +46,7 @@ The development history — what was added when and why — is tracked in
 | [`conf/config.yaml`](conf/config.yaml) | **Pipeline config.** One section per stage — `chain:`, `threedfin:` (Stage 1), `class_unifier:` (diagnostics) and `forainet_prep:` (Stage 2) — plus the shared `paths:` and `classes:` blocks both label stages interpolate. Override any key with its section prefix, e.g. `threedfin.plots=[plot_01]`. |
 | [`misc/`](misc/README.md) | **Standalone tools outside the pipeline.** `misc/tree_splitter.py` (per-tree `.npy` splitting, own `misc/conf/config.yaml`) and `misc/Points2ForAINet.py` (the original generic converter Stage 2 was ported from). |
 | [`requirements.txt`](requirements.txt) | Pinned Python deps (`hydra-zen`, `hydra-core`, `omegaconf`, `laspy`, `lazrs`, `plyfile`, `PyYAML`), all already satisfied by the `aifor` env. **3DFin itself is an external CLI, not a pip dependency of this package.** |
-| [`progress.md`](progress.md) | **Development history** — what functionality was added when, and what is planned. |
+| [`docs/progress.md`](docs/progress.md) | **Development history** — what functionality was added when, and what is planned. |
 | [`.gitignore`](.gitignore) | Excludes the large binary data (input clouds, Stage 1 outputs, Stage 2 clouds) from version control; the small `<plot>_offsets.yml` metadata files stay tracked. |
 
 ### Two 3DFin 0.6.0 quirks the runner works around
@@ -119,13 +121,13 @@ the labels are remapped. The scheme is defined **once** in the `classes:` block 
 [`conf/config.yaml`](conf/config.yaml) and used by both the class unifier and Stage 2, so
 the inspection exports and the clouds ForAINet trains on cannot disagree.
 
-| SegmentedForests `Class` | → ForAINet | Meaning |
+| SegmentedForests `Class` | → `semantic_seg` | Meaning |
 |---|---|---|
-| 0, 4, 5, 6, 7, 12, 13, 22, 23 | **0** | low_vegetation |
-| 1 | **1** | ground |
-| 3, 10 | **2** | stem_points |
-| 2 | **3** | live_branches |
-| 8, 9, 11 | **−1** | no counterpart — **these points are removed** |
+| 8, 9, 11 | **0** | unclassified — no ForAINet counterpart |
+| 0, 4, 5, 6, 7, 12, 13, 22, 23 | **1** | low_vegetation |
+| 1 | **2** | ground |
+| 3, 10 | **3** | stem_points |
+| 2 | **4** | live_branches |
 
 Verified against the data: the union of `Class` over all 14 plots is exactly those 16
 values (individual plots differ — `plot_01` has only `0–4`, `plot_10` has
@@ -136,14 +138,21 @@ Two consequences worth knowing:
 - **The map must be total.** A class present in the data but missing from `class_map`
   **fails that plot** rather than being silently kept or forced to a default — an
   unmapped label would otherwise reach training as a bogus class.
-- **Output is smaller than input.** Dropped points are removed before the coordinates are
-  centered, so `<plot>_offsets.yml` describes exactly the points in the PLY. A cloud put
-  back through `mode=restore` is therefore not a point-for-point match of the 3DFin input
-  (`n_points_source` and `n_points_dropped` in the offsets file record the difference).
+- **The labels are written 1-based, and no points are removed.** ForAINet's reader
+  subtracts one on load (`semantic_seg - 1`), so what it sees is `0`–`3` for the four real
+  classes and `−1` = `IGNORE_LABEL` for *unclassified*. Its losses pass that as
+  `ignore_index`: those points contribute no loss and no gradient, but they stay in the
+  cloud and keep supporting their neighbours' features. Removing them instead would punch
+  holes in the geometry. A cloud put back through `mode=restore` is therefore a
+  point-for-point match of the 3DFin input (`n_points_dropped` is 0). To actually delete a
+  class, map it to `drop_value` (`-1`) — see
+  [Configuration reference → `classes:`](#classes--the-label-scheme).
 
-ForAINet's fifth class (`branches`) receives nothing and was removed from the framework
-itself — those edits live in [`patches/forainet-local.patch`](patches/README.md), since
-`ForAINet/` is a pinned submodule.
+`class_names` in the config gives the same five names, and every `.json`/`.yml` sidecar
+carries a copy. ForAINet's own fifth class (`branches`) has no SegmentedForests
+counterpart and was removed from the framework itself — those edits live in
+[`patches/forainet-local.patch`](patches/README.md), since `ForAINet/` is a pinned
+submodule.
 
 ### Train / val / test — carried by the file name
 
@@ -296,19 +305,213 @@ mamba run -n aifor python class_unifier.py class_unifier.plots=[plot_02]
 > **Delete `…/treeinsfused/processed_0.2/` whenever `raw/` changes.** ForAINet caches
 > its preprocessed tensors there and will happily keep training on the stale ones.
 
-Keys under the `chain:` section of `conf/config.yaml`:
-
-| Key | Meaning |
-|---|---|
-| `stages` | Which stages, in order. `[threedfin, forainet_prep]` (default), or either alone. |
-| `keep_intermediates` | `false` (default) = delete each plot's 3DFin `.las` once Stage 2 has succeeded for it; `true` = keep them all; a **list** of plot names = keep only those. Only point clouds are removed — `3dfin_log.txt` stays, so the folder still records the run. |
-| `plots` | `null` = every cloud in `threedfin.pointclouds_dir`; or a list. |
-| `overwrite` | `false` (default) = skip plots whose final output exists, so a run resumes; `true` = redo everything. |
-| `dry_run` | Log the plan (and each 3DFin command) without writing or deleting anything. |
-| `continue_on_error` | `true` (default) = keep going after a plot fails. |
-
 Nothing is deleted unless `forainet_prep` is in `stages` **and** it reported that plot as
 succeeded. A failure leaves the expensive `.las` in place, so the retry costs minutes.
+
+The keys are in [Configuration reference → `chain:`](#chain--which-stages-run-and-what-survives).
+
+---
+
+## Configuration reference
+
+Everything is set in the single [`conf/config.yaml`](conf/config.yaml). It has one
+top-level section per stage plus two shared blocks, and each entry script reads only its
+own section. Any key can be overridden on the command line with its section prefix:
+
+```bash
+mamba run -n aifor python main_pipeline.py chain.plots=[plot_01] threedfin.normalize=true
+```
+
+Overrides last for that one run; edit the file to make them stick.
+
+### Keys every stage has
+
+These appear in `chain:`, `threedfin:`, `class_unifier:` and `forainet_prep:` with the
+same meaning, so they are described once here rather than in every table below.
+
+| Key | Default | What it does |
+|---|---|---|
+| `plots` | `null` | `null` = process everything found; or a list like `[plot_01, plot_05]`. Names are plot stems, without the `.laz`. |
+| `overwrite` | varies | `false` = skip a plot whose output already exists, which is what makes an interrupted run resumable; `true` = redo it. `chain:` defaults to `false` (a redo can cost hours of 3DFin), `class_unifier:` and `forainet_prep:` to `true`. **`threedfin:` has no such key** — 3DFin always re-runs, so the chain's skip is the only guard against repeating it. |
+| `dry_run` | `false` | Log what *would* happen — including each 3DFin command line — without reading point data, writing files or deleting anything. Worth doing before any long run. |
+| `continue_on_error` | `true` | Keep going after a plot fails. `false` stops at the first one. |
+
+### Keys the parallel stages have
+
+`class_unifier:` and `forainet_prep:` process several plots at once in worker processes
+(see [`pipeline/parallel.py`](pipeline/parallel.py)). 3DFin stays sequential, and the
+chain hands Stage 2 one plot at a time, so these do nothing there.
+
+| Key | Default | What it does |
+|---|---|---|
+| `workers` | `null` | `null` = as many plots at once as the memory budget allows, capped by CPU count; an integer caps it; `1` runs everything inline in this process. |
+| `memory_budget_frac` | `0.7` | Fraction of total RAM the run may commit. The rest is headroom for the OS. |
+| `bytes_per_point` | `140` | Measured peak RSS per point, used to size each plot's share. |
+
+**Concurrency here is bounded by RAM, not cores.** These clouds run from 19 M to 280 M
+points at ~140 bytes/point (measured: plot_09, 72.6 M points → 9.1 GB peak), so the
+biggest needs ~39 GB on its own and a worker per core would exhaust the machine. Each
+plot's size is read from its LAS header (instant, no point data) and work is admitted
+only while it still fits the budget — a huge plot runs nearly alone while small ones pack
+several deep. Lower `memory_budget_frac` if other work is competing for memory; raise
+`bytes_per_point` if you see the machine swap.
+
+### `paths:` — machine-specific locations
+
+| Key | What it is |
+|---|---|
+| `assignment` | This repository's root. Every other path is built from it, so on another machine this is usually the only line to change. |
+| `forainet` / `forainet_dataroot` | The ForAINet submodule checkout and the dataset root inside it. |
+| `forainet_raw` | Where Stage 2 writes the clouds ForAINet trains on. |
+| `offsets` | Where the `<plot>_offsets.yml` files live — deliberately outside the submodule. |
+
+**`forainet_raw` is not a free choice.** ForAINet assembles that path itself and then
+globs it:
+
+```
+base_dataset.py    _data_path = <dataroot>/<dataset_name>
+                   ...where dataset_name falls back to the DATASET CLASS NAME, lower-cased
+                   and minus "dataset" -> "treeinsfused". That part is baked into the
+                   Python, not configurable.
+torch_geometric    raw_dir    = <_data_path>/raw
+treeins_set1.py    glob(raw_dir + "/**/*.ply", recursive=True)
+```
+
+`dataroot` (`data_set1_5classes`) comes from ForAINet's *own*
+`conf/data/panoptic/treeins_set1.yaml` — change it there and change it here too. The
+final folder (`SegmentedForests`) *is* free, because the glob is recursive; it just groups
+our plots the way the reference data groups NIBIO2/CULS/SCION. Since this sits inside the
+pinned submodule, that checkout has to exist (`git submodule update --init`) before
+Stage 2 can write.
+
+`offsets` stays in the repo on purpose: those files are small, tracked by git, and the
+only thing that makes `mode=restore` possible, so they should not be buried in a data
+folder that gets wiped when datasets change.
+
+### `classes:` — the label scheme
+
+Not a stage — there is no engine behind it. It is plain config, interpolated by **both**
+stages that touch labels (`class_unifier:` and `forainet_prep:`), so the inspection
+exports and the clouds ForAINet actually trains on can never disagree about what a class
+number means. Pointing the pipeline at another dataset means a different `class_map` and
+field names, not a code change.
+
+| Key | Default | What it does |
+|---|---|---|
+| `semantic_field` | `Class` | Source column holding the ground-truth label. Stated explicitly rather than auto-detected: silently picking the wrong column is exactly the failure this block exists to prevent. |
+| `tree_id_field` | `tree_ID` | Source column holding the tree/instance id. |
+| `unified_field` | `semantic_seg` | Name of the **new** column that receives the remapped labels. |
+| `drop_value` | `-1` | Points whose mapped label equals this are physically removed. `null` keeps every point. Currently inert — see below. |
+| `class_map` | 16 entries | `{source: unified}`. Several sources sharing a target merge those classes. See [Semantic classes](#semantic-classes-segmentedforests--forainet). |
+| `class_names` | 5 entries | The unified scheme, echoed into every `.json`/`.yml` sidecar. |
+| `instance_classes` | `[3, 4]` | Which classes are made of individual trees. `null` passes tree ids through untouched. |
+
+**`drop_value` is deliberately inert.** Nothing in `class_map` targets `-1`, so nothing is
+dropped. The classes with no ForAINet counterpart (8, 9, 11) go to `0` = *unclassified*
+instead, and ForAINet's reader subtracts one (`semantic_seg - 1`), turning `0` into
+`-1` = `IGNORE_LABEL`. Its losses pass that as `ignore_index`, so those points contribute
+no loss and no gradient but **stay in the cloud** — their geometry still supports the
+neighbourhood features of every point around them. Deleting them instead would punch holes
+in the cloud and change what nearby points see. The key is kept as a safety valve: map a
+class to `-1` here if you ever do want it gone.
+
+**`instance_classes` is why the instance head works at all.** Everything outside these
+classes is "stuff" (ground, undergrowth) and must carry tree id `0` = "not part of any
+tree" — the convention ForAINet's own files follow. 3DFin does not follow it: it gives
+every point the id of the nearest stem, so ground and undergrowth beneath a tree inherit
+that tree's id (measured: id 114189 covered 3.0 M points, 1.6 M of them ground and low
+vegetation). ForAINet's `set_extra_labels()` then skips any instance whose id also appears
+on a stuff point — which, with 3DFin ids, was **every single one: 0 of 42 tree instances
+survived on plot_10**. Stage 2 therefore zeroes the tree id outside these classes.
+
+> **Hydra gotcha — change this block by editing the file.** Its keys are *integers*, which
+> makes CLI overrides fail in confusing ways (measured, not guessed):
+>
+> | Override | Result |
+> |---|---|
+> | `classes.class_map.5=1` | **Fails** `Key '5' is not in struct` — the override parser hands over a *string* key |
+> | `classes.class_map={99: 0}` | **Fails** the same way |
+> | `++classes.class_map={99: 0}` | Merges, adding that entry |
+> | `class_unifier.class_map={…}` | **Replaces** that stage's map wholesale, severing the link to this block — so `forainet_prep` keeps the old one and the two stages silently disagree |
+>
+> Reserve the CLI for one-off experiments, never for a run whose output feeds training.
+
+### `chain:` — which stages run, and what survives
+
+Run with `python main_pipeline.py` (engine: [`pipeline/chain.py`](pipeline/chain.py)).
+Plus the [shared run-control keys](#keys-every-stage-has).
+
+| Key | Default | What it does |
+|---|---|---|
+| `stages` | `[threedfin, forainet_prep]` | Which stages, in order. `[threedfin]` alone = 3DFin only, nothing deleted (what `main_pipeline.py` meant before the chain existed). `[forainet_prep]` alone converts already-produced 3DFin output, consuming it as it goes. `null` = both. An empty list is an error. |
+| `keep_intermediates` | `false` | `false` = delete each plot's 3DFin `.las` once Stage 2 has succeeded for it. `true` = keep them all — do this while you are still tuning the class scheme. A **list** of plot names keeps just those, which is how the diagnostics stay affordable (`class_unifier` needs the `tree_ID` only 3DFin produces, so inspecting one plot costs ~1.5 GB rather than 46 GB). |
+
+Only point clouds are deleted — `3dfin_log.txt` stays, so each plot folder still records
+its run. Nothing is deleted unless `forainet_prep` is in `stages` **and** reported that
+plot as succeeded.
+
+### `threedfin:` — Stage 1, 3DFin instance segmentation
+
+Engine: [`pipeline/threedfin.py`](pipeline/threedfin.py). Reached through the chain;
+`chain.stages=[threedfin]` runs it alone. Plus the
+[shared run-control keys](#keys-every-stage-has).
+
+| Key | Default | What it does |
+|---|---|---|
+| `pointclouds_dir` | `…/SegmentedForests/pointclouds` | Input clouds. |
+| `ini_dir` | `…/SegmentedForests/3DFin_settings` | Where each plot's `<stem>.ini` parameter file lives. A plot with no matching `.ini` is skipped with a warning. |
+| `output_dir` | `…/SegmentedForests/3DFin_output` | Results root — one subfolder per plot. |
+| `threedfin_bin` | `…/envs/aifor/Scripts/3DFin.exe` | The 3DFin executable. On Windows a console entry point becomes a `Scripts\*.exe` launcher; on Linux it is `envs/aifor/bin/3DFin`. |
+| `pattern` | `"*.laz"` | Glob selecting input clouds. |
+| `normalize` / `denoise` / `export_txt` | `null` | Tri-state 3DFin CLI flags. `null` (recommended) derives each from that plot's `.ini` `[misc]` section; `true`/`false` forces it for every plot. Note 3DFin maps `is_normalized = not --normalize` — the dataset clouds are *not* height-normalized, so deriving from the `.ini` passes `--normalize`. |
+| `prune_outputs` | `true` | After a successful run, delete everything 3DFin emitted for that plot except `<plot>_tree_ID_dist_axes.las` and `3dfin_log.txt` — the only file this project needs, plus its log. `false` keeps all ~10 files. |
+
+### `class_unifier:` — diagnostics (optional)
+
+Run with `python class_unifier.py` (engine:
+[`pipeline/class_unifier.py`](pipeline/class_unifier.py)). Nothing downstream reads its
+output; it exists so you can *look at* a class merge. Plus the
+[shared run-control](#keys-every-stage-has) and [parallelism](#keys-the-parallel-stages-have) keys.
+
+| Key | Default | What it does |
+|---|---|---|
+| `input_dir` | `…/3DFin_output` | Input root. Matched both directly (flat layout) and one level down in per-plot subfolders (the 3DFin output tree). |
+| `patterns` | `["*.las", "*.laz", "*.ply"]` | Globs matched in both layouts. Any mix of LAS 1.2–1.4, LAZ and PLY is processed identically. |
+| `output_dir` | `…/ClassUnifier_output` | Receives `<plot>.<ply\|npy>` + a `<plot>.json` sidecar (the map used, drop counts, per-class counts before and after). Created if missing. |
+| `output_format` | `ply` | `ply`, `npy`, or `both`. The `.json` is written either way. |
+| `semantic_field` / `tree_id_field` | from `classes:` | Interpolated from the shared block, so this stage and Stage 2 cannot disagree. |
+| `intensity_field` | `null` | `null` = auto-detect (`intensity`, `scalar_Intensity`, …). Intensity has no bearing on the label scheme, so it stays local rather than living in `classes:`. A *configured* name missing from a file fails that plot loudly instead of silently writing zeros. |
+| `unified_field` / `class_map` / `drop_value` / `class_names` | from `classes:` | The unification itself. |
+
+**Use `ply` for viewing.** A PLY keeps each column's real dtype, and
+[the viewer](misc/README.md) only draws class colours, a legend, unique counts and
+per-value histogram bars for **integer** columns. A `.npy` is a single float64 matrix, so
+every label in it renders as a continuous ramp instead — which defeats the point of
+checking a merge. The PLY is smaller too (~32 vs 56 bytes/point). `npy` stays available
+for loading straight into numpy.
+
+Coordinates stay **original** here — centering belongs to Stage 2, which also writes the
+offsets file that makes it reversible.
+
+### `forainet_prep:` — Stage 2, centering and restore
+
+Run with `python forainet_prep.py` (engine:
+[`pipeline/forainet_prep.py`](pipeline/forainet_prep.py)); also called per plot by the
+chain, from this same section. Plus the [shared run-control](#keys-every-stage-has) and
+[parallelism](#keys-the-parallel-stages-have) keys.
+
+| Key | Default | What it does |
+|---|---|---|
+| `mode` | `preprocess` | `preprocess` = input clouds → centered PLYs + `<plot>_offsets.yml`; `restore` = classified PLYs → original coordinates. |
+| `input_dir` / `patterns` | `…/3DFin_output`, all three extensions | Preprocess input, same two-layout matching as `class_unifier`. Narrow `patterns` to `["*_tree_ID_dist_axes.las"]` when a plot folder holds more than one matching cloud (e.g. `prune_outputs: false`). |
+| `output_dir` | `${paths.forainet_raw}` | The PLYs go straight where ForAINet globs for them — no copy step, and no chance of training on a stale copy. |
+| `semantic_field` / `tree_id_field` / `intensity_field` | from `classes:`, `null` | As in `class_unifier:` above. |
+| `class_map` / `drop_value` | from `classes:` | The PLYs written here are what ForAINet trains on, so they carry the unified labels; without this the framework would see the raw source classes. |
+| `instance_classes` | from `classes:` | Points outside these classes get tree id 0 — see the note above. |
+| `split` | `{n_val: 1, n_test: 2}` | Appends `_train`/`_val`/`_test` to each PLY name, which is the only way ForAINet learns what a cloud is for. Each value is a count (int) or a fraction of the plots (float < 1). `null` writes plain `<plot>.ply`. See [Train / val / test](#train--val--test--carried-by-the-file-name). |
+| `restore_dir` | `null` | Restore only: folder of classified `*.ply` to restore. **Required** for `mode=restore`; files already named `restored_*` are ignored. |
+| `offsets_dir` | `${paths.offsets}` | Where `<plot>_offsets.yml` live, in **both** modes. `null` = beside the clouds. |
+| `restore_format` | `laz` | `laz` = compressed LAS 1.4 with the source scales and CRS re-applied and every extra field kept as an extra-bytes dimension; `las` = the same, uncompressed; `ply` = plain PLY. |
 
 ---
 
@@ -338,16 +541,8 @@ mamba run -n aifor python main_pipeline.py chain.stages=[threedfin] threedfin.no
 > the plots (the chain drives the loop), while `threedfin.*` still configures how each
 > 3DFin run is made.
 
-Useful keys under the `threedfin:` section of `conf/config.yaml`:
-
-| Key | Meaning |
-|---|---|
-| `pattern` | Glob for selecting input clouds (default `*.laz`). |
-| `plots` | `null` = all plots; or a list like `[plot_01, plot_05]`. |
-| `normalize` / `denoise` / `export_txt` | `null` = derive from each `.ini`; `true`/`false` = force for all plots. |
-| `prune_outputs` | `true` (default) = after a successful run, keep only `<plot>_tree_ID_dist_axes.las` + `3dfin_log.txt`; `false` = keep the full 3DFin output set. |
-| `dry_run` | `true` = log commands only, no files written, no 3DFin run. |
-| `continue_on_error` | `true` (default) = keep going after a plot fails; `false` = stop at first failure. |
+The keys are in
+[Configuration reference → `threedfin:`](#threedfin--stage-1-3dfin-instance-segmentation).
 
 ---
 
@@ -385,12 +580,16 @@ or one level down in per-plot subfolders (the 3DFin output tree from Stage 1).
 
 1. Computes the per-plot **coordinate shifts** `offset_x/y/z = min(x/y/z)` and subtracts
    them (**centering** — every coordinate becomes ≥ 0, with 0 at the plot corner).
-2. Writes `SegmentedForests/ForAINet_input/<plot>.ply` with the ForAINet fields —
-   `semantic_seg` from the first of `Class`/`semantic_seg`/`classification` found,
-   `treeID` from `tree_ID`/`treeID`, `intensity` from the source (zeros + warning when
+2. Writes `<output_dir>/<plot>_<split>.ply` — by default
+   `ForAINet/…/treeinsfused/raw/SegmentedForests/plot_02_train.ply`, straight into the
+   folder ForAINet globs. The vertex fields are `x, y, z, intensity, semantic_seg,
+   treeID`: `semantic_seg` remapped through `class_map` from the first of
+   `Class`/`semantic_seg`/`classification` found, `treeID` from `tree_ID`/`treeID` and
+   zeroed outside `instance_classes`, `intensity` from the source (zeros + warning when
    a field is absent). For data with other ground-truth field names, set
    `semantic_field` / `tree_id_field` / `intensity_field` explicitly.
-3. Saves `<plot>_offsets.yml` next to the PLY: the shifts, validation statistics
+3. Saves `<plot>_offsets.yml` — in `offsets_dir`, i.e. `SegmentedForests/ForAINet_input/`,
+   kept out of the submodule and tracked by git. It holds the shifts, validation statistics
    (original mins/ranges, point count) **and the source metadata needed for a faithful
    restoration** — source format/file, LAS version, point format, scales, and the CRS
    as WKT (`null` for PLY sources or clouds without a CRS, like the current dataset).
@@ -412,22 +611,8 @@ mamba run -n aifor python forainet_prep.py forainet_prep.mode=restore \
     forainet_prep.restore_dir=/path/to/classified_plys
 ```
 
-Key keys under the `forainet_prep:` section of [`conf/config.yaml`](conf/config.yaml):
-
-| Key | Meaning |
-|---|---|
-| `mode` | `preprocess` (input clouds → centered PLYs + offset files) or `restore` (classified PLYs → original coordinates). |
-| `input_dir` / `patterns` / `output_dir` | Preprocess: input root (flat or per-plot subfolders), the globs matched in both layouts (default `["*.las", "*.laz", "*.ply"]`), and the folder receiving `<plot>.ply` + `<plot>_offsets.yml`. Narrow `patterns` to `["*_tree_ID_dist_axes.las"]` when plot folders hold several clouds (e.g. `prune_outputs=false`). |
-| `semantic_field` / `tree_id_field` / `intensity_field` | Preprocess: names of the source fields holding the ground-truth label, tree id, and intensity. `null` = auto-detect (`Class`/`semantic_seg`/`classification`, `tree_ID`/`treeID`, `intensity`/`scalar_Intensity`/…); set explicitly for data with other field names — a configured name missing from a file fails that plot loudly. |
-| `restore_dir` | Restore: folder of classified `*.ply` files (required; `restored_*` files are ignored). |
-| `offsets_dir` | Restore: where the `<plot>_offsets.yml` live; `null` = `output_dir`. |
-| `restore_format` | `laz` (default) = compressed LAS 1.4, source scales + CRS re-applied, all fields kept as extra dims; `las` = same, uncompressed; `ply` = plain PLY. |
-| `plots` / `overwrite` / `dry_run` / `continue_on_error` | Same semantics as in Stage 1. |
-
-> **Planned:** semantic-label reclassification (merging classes and assigning new class
-> numbers) via a `class_map` config key — it will plug into `_semantic_labels()` in
-> [`pipeline/forainet_prep.py`](pipeline/forainet_prep.py), where the `Class` →
-> `semantic_seg` assignment is isolated.
+The keys are in
+[Configuration reference → `forainet_prep:`](#forainet_prep--stage-2-centering-and-restore).
 
 ---
 

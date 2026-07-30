@@ -404,6 +404,33 @@ Dates follow the Hydra run logs in `outputs/<date>/<time>/`.
   `ClassUnifier_output/` and `ForAINet_input/*.ply` were removed (the tracked
   `*_offsets.yml` kept).
 
+## 2026-07-30 — `conf/config.yaml` slimmed to a settings file; keys documented in the README
+
+- **Why.** The config had reached **366 lines for ~70 settings** — every rationale,
+  measurement and gotcha found while building the pipeline had accumulated in it. Changing
+  `n_val` meant scrolling past a 20-line essay on ForAINet's `ignore_index` semantics.
+- **Now 120 lines**: values, a one-line header per section, and a short inline hint only
+  where a value is not self-explanatory (`null` meanings, legal enum values). Verified as a
+  comment-only change — the resolved config (`OmegaConf.to_container(..., resolve=True)`)
+  is identical before and after, key for key.
+- **README gains a `## Configuration reference` section**: one subsection per config block
+  with a `Key | Default | What it does` table, plus the run-control keys
+  (`plots`/`overwrite`/`dry_run`/`continue_on_error`) and parallelism keys
+  (`workers`/`memory_budget_frac`/`bytes_per_point`) documented **once** instead of in four
+  places. The three scattered key tables it replaces were deleted, so there is exactly one
+  description of each key. A scratch cross-check asserts all 47 config keys appear there
+  and nothing is documented that does not exist.
+- The rationale worth keeping moved with it: why `forainet_raw` is not a free choice, the
+  Hydra integer-key gotcha, why `drop_value` is inert, why `instance_classes` exists, and
+  the RAM-not-cores concurrency model.
+- **Stale documentation fixed while reading** (each already contradicted the code):
+  the class-mapping table was still 0-based and claimed classes 8/9/11 were *removed*
+  (they map to `0` = unclassified and nothing is dropped — `n_points_dropped` is 0);
+  Stage 2 was described as writing to `SegmentedForests/ForAINet_input/<plot>.ply`
+  (it writes `${paths.forainet_raw}/<plot>_<split>.ply`); a "**Planned:** reclassification
+  via a `class_map` key" note survived long after that shipped; and two links pointed at
+  `progress.md` and a `ForAINet/ARCHITECTURE_ANALYSIS.md` that no longer exist.
+
 ---
 
 ## Planned

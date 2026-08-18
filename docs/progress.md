@@ -519,6 +519,45 @@ Dates follow the Hydra run logs in `outputs/<date>/<time>/`.
 - README: restored the pointer to `docs/ARCHITECTURE_ANALYSIS.md`, which a previous
   link fix had redirected to the submodule's own readme.
 
+## 2026-08-12 — TorchSparse 1.4 available as a second backbone; MinkowskiEngine still default
+
+- **Why.** The framework prints *"Minkowski API is deprecated in favor of the SparseConv3d
+  API"* three times per run. `docs/backbone_torchsparse_1.4.md` had already worked out the
+  swap; every claim in it was re-verified against the code before implementing.
+- **Two model blocks, one knob.** `model_name=PointGroup-PAPER` → MinkowskiEngine (the
+  default, `conf/config.yaml` untouched); `model_name=PointGroup-PAPER-TS` → TorchSparse
+  1.4. Same switch for `train.py` and `eval.py`.
+- **New `PointGroup3heads_ts.py`**, a copy of `PointGroup3heads.py` differing in four
+  lines (the import plus `backend=` on the three `SparseConv3d(...)` constructions).
+  **A copy, not an edit**, because the two applications resolve `ResNetDown`/`ResNetUp`
+  against *different* modules — `applications/minkowski.py:9` imports
+  `modules/MinkowskiEngine/api_modules`, `applications/sparseconv3d.py:11` imports
+  `modules/SparseConv3d/modules`, and both then set `modules_lib = sys.modules[__name__]`.
+  Editing in place would have changed the Minkowski path too and invalidated the baseline
+  in `docs/train_logs.md`. Verified: `diff` between the two files shows only those four
+  changes.
+- **The yaml block is four lines**, inheriting all ~115 lines of `PointGroup-PAPER`
+  through a YAML merge key (`<<: *paper`) so the two cannot drift. Verified that OmegaConf
+  honours merge keys, and asserted mechanically that the two blocks differ in exactly
+  `class` (value) and `backend` (key) — i.e. **`PointGroup-PAPER` is provably untouched**.
+- **Hazards checked, not assumed.** The coordinate-order difference (minkowski
+  `[batch,x,y,z]` vs torchsparse `[x,y,z,batch]`) bites only
+  `SparseConv3dEncoder.forward`, which reads `data.C[:, 0]`; that path is unreachable at
+  `scorer_type: "unet"`. `SparseConv3dUnet.forward` returns no `batch` field, which is
+  safe because the model reads `.x` only and takes `batch` from the *input*. Both noted in
+  the new file's comments so the next person does not have to re-derive them.
+- **No image rebuild**: `torchsparse@v1.4.0` is already installed (`Dockerfile:77-78`), and
+  `nn/torchsparse.py` uses the 1.4 API (`TS.SparseTensor`).
+- **Deleted `ForAINet_new_backbone/`** (639 MB). It was a copy whose `.git` was a *file*
+  reading `gitdir: ../.git/modules/ForAINet` — `git rev-parse --show-toplevel` inside it
+  returned the **original**, so every git command there operated on the wrong tree and no
+  patch could ever be produced from it. 627 MB of its bulk was copied `outputs/`. Confirmed
+  byte-identical to the original before removing.
+- Patch regenerated (7 files). `patches/README.md` gained the `git add -N` step the new
+  file requires — without it `git diff` silently drops the file from the patch — and the
+  non-destructive `git apply --check --reverse` verification, since `git stash` refuses to
+  move intent-to-add entries and therefore proves nothing.
+
 ---
 
 ## Planned

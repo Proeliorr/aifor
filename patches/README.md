@@ -10,14 +10,15 @@ instead: versioned in **our** repo, never pushed upstream.
 
 ## `forainet-local.patch`
 
-Adapts upstream to this project. **Six files**, of which three carry the class-scheme
+Adapts upstream to this project. **Seven files**, of which three carry the class-scheme
 change and are the ones that matter:
 
 | File | Why |
 |---|---|
+| `torch_points3d/models/panoptic/PointGroup3heads_ts.py` | **new file** — the same model on the TorchSparse 1.4 backbone, selected by `model_name=PointGroup-PAPER-TS`. MinkowskiEngine stays the default; see [`docs/backbone_torchsparse_1.4.md`](../docs/backbone_torchsparse_1.4.md) |
 | `torch_points3d/datasets/segmentation/treeins_set1.py` | **5 → 4 classes.** `Treeins_NUM_CLASSES`, `INV_OBJECT_LABEL`, `OBJECT_COLOR` — upstream's class 4 `branches` has no SegmentedForests counterpart, so nothing can ever map to it |
 | `torch_points3d/datasets/panoptic/treeins_set1.py` | the same table again (it is declared twice), plus `VALID_CLASS_IDS`, `SemIDforInstance`, and the `final_eval` counters `NUM_CLASSES_sem`, `NUM_CLASSES_count`, `sem_classcount`, `thing_classes` |
-| `conf/models/panoptic/FORpartseg_3heads.yaml` | `path_pretrained: null` — upstream points it at a **5-class** checkpoint on the author's cluster (see below) |
+| `conf/models/panoptic/FORpartseg_3heads.yaml` | `path_pretrained: null` (upstream points it at a **5-class** checkpoint on the author's cluster, see below), plus the `PointGroup-PAPER-TS` block that selects the TorchSparse model file |
 | `conf/training/treeins_set1.yaml` | our `wandb` entity + experiment name (upstream ships the author's `binbin`) |
 | `conf/training/default.yaml` | short debug runs (`epochs: 5`, `num_workers: 0`, `batch_size: 4`), our `wandb` entity/project, tensorboard off |
 | `train.py` | `import debugpy` + `debugpy.breakpoint()` for container debugging |
@@ -62,15 +63,28 @@ operation, and before building a training image.
 
 ```bash
 cd ForAINet
+# `git diff` cannot see a file git has never heard of, and the patch ADDS one.
+# Without this line PointGroup3heads_ts.py silently vanishes from the patch.
+git add -N PointCloudSegmentation/torch_points3d/models/panoptic/PointGroup3heads_ts.py
 git diff -- . ':(exclude)*.pyc' > ../patches/forainet-local.patch
 ```
 
 The `.pyc` exclusion is essential: upstream commits bytecode (see below), so a bare
 `git diff` sweeps ~115 recompiled `.pyc` files into the patch.
 
-**Untracked files are not captured.** `git diff` only sees tracked changes, so anything
-you created inside `ForAINet/` (e.g. `omegatest.py`) lives nowhere but your disk. Copy it
-into this repo if it matters.
+Verify the result **without touching the working tree** — if the patch reverses cleanly,
+it is an exact description of what you have:
+
+```bash
+git apply --check --reverse ../patches/forainet-local.patch   # exit 0 = faithful
+```
+
+(Do not try to verify by stashing: `git stash` refuses to move intent-to-add entries, so
+the tree does not actually become pristine and the test silently proves nothing.)
+
+**Other untracked files are still not captured.** `git diff` only sees tracked changes
+plus anything you `add -N`, so anything else you created inside `ForAINet/` (e.g.
+`omegatest.py`) lives nowhere but your disk. Copy it into this repo if it matters.
 
 Write it with a tool that does **not** add a UTF-8 BOM — PowerShell's
 `Out-File -Encoding utf8` does, and `git apply` then rejects the file. The shell

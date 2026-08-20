@@ -327,6 +327,11 @@ The keys are in [Configuration reference → `chain:`](#chain--which-stages-run-
 
 ### Training on a rented GPU
 
+> **Step-by-step runbook: [`docs/gpu_training_runbook.md`](docs/gpu_training_runbook.md).**
+> Local smoke test → Docker Hub → Cloudflare R2 → Vast.ai → two trained models (one per
+> backbone) → downloading the results. The rest of this section explains *why* the export
+> is LAZ; the runbook is the procedure.
+
 This is why Stage 2 exports LAZ. A binary PLY is an uncompressed memory dump, so the
 clouds ForAINet reads are **29.21 GB against 4.32 GB for the same points as LAZ** —
 6.8× measured over all 14 plots — and on a rented machine every one of those bytes

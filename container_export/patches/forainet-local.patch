@@ -1,0 +1,1079 @@
+diff --git a/PointCloudSegmentation/conf/models/panoptic/FORpartseg_3heads.yaml b/PointCloudSegmentation/conf/models/panoptic/FORpartseg_3heads.yaml
+index fa9002b..4fe6313 100644
+--- a/PointCloudSegmentation/conf/models/panoptic/FORpartseg_3heads.yaml
++++ b/PointCloudSegmentation/conf/models/panoptic/FORpartseg_3heads.yaml
+@@ -60,7 +60,7 @@ PointGroup:
+ 
+   vizual_ratio: 0
+ 
+-PointGroup-PAPER:
++PointGroup-PAPER: &paper
+   class: PointGroup3heads.PointGroup3heads
+   conv_type: "SPARSE"
+   scorer_type: "unet"
+@@ -174,4 +174,39 @@ PointGroup-PAPER:
+   cluster_type: 7
+   vizual_ratio: 0
+ 
+-  path_pretrained: "/cluster/work/igp_psr/binbin/OutdoorPanopticSeg_V2/outputs/setting1_classes5_mixtree_1000/setting1_classes5_mixtree_1000-PointGroup-PAPER-20240205_132553/PointGroup-PAPER.pt"
++  # LOCAL PATCH (SegmentedForests): was a FIVE-class checkpoint on the original author's
++  # cluster ("setting1_classes5_mixtree_1000/...PointGroup-PAPER.pt"). Two reasons it is
++  # null now:
++  #   1. The path does not exist here, so it only ever produced
++  #      "The path does not exist, it will not load any model" (base_model.py:154) --
++  #      every run was already training from scratch, by accident rather than by choice.
++  #   2. If it ever DID resolve, base_model.py calls
++  #      load_state_dict_with_same_shape(m, strict=False), which silently skips layers
++  #      whose shape changed. Our semantic head is 4-wide, that checkpoint's is 5, so the
++  #      head would be quietly dropped and you would believe you were fine-tuning.
++  # Point this at a 4-class checkpoint to fine-tune.
++  path_pretrained: null
++
++# LOCAL ADDITION (SegmentedForests): the same model on the TorchSparse 1.4 backbone.
++#
++# MinkowskiEngine stays the default -- conf/config.yaml selects PointGroup-PAPER above and
++# nothing here changes it. Ask for this one by name:
++#
++#   python train.py ... model_name=PointGroup-PAPER-TS
++#
++# `<<: *paper` is a YAML merge key: every setting is inherited from PointGroup-PAPER and
++# only the two lines below differ, so the backbone shape, scorer_type, prepare_epoch and
++# the rest cannot drift between the two blocks.
++#
++# `class:` is the real backbone switch -- it selects the Python file, and that file's
++# import decides the sparse-conv library. (The `class: minkowski.Minkowski_Model` keys in
++# the backbone/scorer blocks above are INERT: the factory passes model_type=None, so
++# module lookup falls back to BaseFactory and resolves module_name against whatever the
++# application module imported. Editing them does nothing.)
++#
++# Gotcha: SPARSE_BACKEND in the environment silently overrides `backend` below
++# (applications/sparseconv3d.py:59-62). Unset it, or this block will not run TorchSparse.
++PointGroup-PAPER-TS:
++  <<: *paper
++  class: PointGroup3heads_ts.PointGroup3heads
++  backend: "torchsparse"
+diff --git a/PointCloudSegmentation/conf/training/default.yaml b/PointCloudSegmentation/conf/training/default.yaml
+index e07724b..7af3899 100644
+--- a/PointCloudSegmentation/conf/training/default.yaml
++++ b/PointCloudSegmentation/conf/training/default.yaml
+@@ -1,8 +1,8 @@
+ # @package training
+ # Those arguments defines the training hyper-parameters
+-epochs: 100
+-num_workers: 6
+-batch_size: 16
++epochs: 5
++num_workers: 0
++batch_size: 4
+ shuffle: True
+ cuda: 0 # -1 -> no cuda otherwise takes the specified index
+ precompute_multi_scale: False # Compute multiscate features on cpu for faster training / inference
+@@ -29,15 +29,16 @@ checkpoint_dir: ""
+ # Those arguments within experiment defines which model, dataset and task to be created for benchmarking
+ # parameters for Weights and Biases
+ wandb:
+-  entity: ""
+-  project: default
++  entity: "aifor" #TO ADAPT: change to your own wandb account name
++  project: FOR-dataset #panoptic-boost
+   log: True
+-  notes:
+-  name:
++  notes: ""
++  name: "aifor" #TO ADAPT: specify name of experiment that will be shown on wandb
++  id:
+   public: True # It will be display the model within wandb log, else not.
+   config:
+-    model_name: ${model_name}
++    grid_size: ${data.grid_size}
+ 
+   # parameters for TensorBoard Visualization
+ tensorboard:
+-  log: True
++  log: False
+diff --git a/PointCloudSegmentation/conf/training/treeins_set1.yaml b/PointCloudSegmentation/conf/training/treeins_set1.yaml
+index 54b0608..0788b3f 100644
+--- a/PointCloudSegmentation/conf/training/treeins_set1.yaml
++++ b/PointCloudSegmentation/conf/training/treeins_set1.yaml
+@@ -30,11 +30,11 @@ checkpoint_dir: ""
+ # Those arguments within experiment defines which model, dataset and task to be created for benchmarking
+ # parameters for Weights and Biases
+ wandb:
+-  entity: "binbin" #TO ADAPT: change to your own wandb account name
++  entity: "aifor" #TO ADAPT: change to your own wandb team/account name
+   project: FOR-dataset #panoptic-boost
+   log: True
+   notes: "set1_5classes treeins"
+-  name: "set1_5classes treeins" #TO ADAPT: specify name of experiment that will be shown on wandb
++  name: "aifor" #TO ADAPT: specify name of experiment that will be shown on wandb
+   id:
+   public: True # It will be display the model within wandb log, else not.
+   config:
+diff --git a/PointCloudSegmentation/torch_points3d/datasets/panoptic/treeins_set1.py b/PointCloudSegmentation/torch_points3d/datasets/panoptic/treeins_set1.py
+index 4fe0472..fa659cb 100644
+--- a/PointCloudSegmentation/torch_points3d/datasets/panoptic/treeins_set1.py
++++ b/PointCloudSegmentation/torch_points3d/datasets/panoptic/treeins_set1.py
+@@ -18,12 +18,14 @@ from torch_points3d.models.panoptic.ply import read_ply, write_ply
+ 
+ # @Treeins
+ # -1 means unlabelled semantic classes
++# LOCAL PATCH (SegmentedForests): 5 -> 4 classes; upstream class 4 "branches" has no
++# counterpart in the SegmentedForests labelling. Kept in sync with the same names and
++# colours in datasets/segmentation/treeins_set1.py, which declares them a second time.
+ CLASSES_INV = {
+     0: "low_vegetation",
+     1: "ground",
+     2: "stem_points",
+     3: "live_branches",
+-    4: "branches",
+ }
+ 
+ OBJECT_COLOR = np.asarray(
+@@ -32,13 +34,14 @@ OBJECT_COLOR = np.asarray(
+         [95, 156, 196],  # 'ground' .-> . blue
+         [179, 116, 81],  # 'stem_points'  ->  brown
+         [241, 149, 131],  # 'live_branches'  ->  salmon
+-        [81, 163, 148],  # 'branches'  ->  bluegreen
+         [0, 0, 0],  # unlabelled .->. black
+     ]
+ )
+ 
+-VALID_CLASS_IDS = [0, 1, 2, 3, 4]
+-SemIDforInstance = np.array([2,3,4])  # only class tree/1 is is a semantic class with instances, namely tree instances. In contrast, semantic class non-tree is a stuff class.
++VALID_CLASS_IDS = [0, 1, 2, 3]
++# Semantic classes that carry tree instances. "branches" (4) is gone, so instances now
++# come from stem_points + live_branches only.
++SemIDforInstance = np.array([2,3])  # only class tree/1 is is a semantic class with instances, namely tree instances. In contrast, semantic class non-tree is a stuff class.
+ 
+ 
+ ################################### UTILS #######################################
+@@ -102,20 +105,31 @@ def to_ins_ply(pos, label, file):
+ 
+ # @Treeins: added parameter output_file_name because we now save several final evaluation files because we have several test files
+ def final_eval(pre_sem, pre_ins_offset, pos, gt_sem, gt_ins, output_file_name):
++    # LOCAL PATCH (SegmentedForests): 5 -> 4 semantic classes.
++    # NOTE the counters below are 1-BASED and shifted: 0 = unclassified, so semantic
++    # class i is counted as i+1. Dropping 0-based class 4 ("branches") therefore drops
++    # the 1-based id 5 from the lists.
++    # NUM_CLASSES stays 3: it counts the BINARY scheme (unclassified / stuff / thing)
++    # used further down, after the labels are collapsed at "mapping labels", and is
++    # independent of how many fine-grained classes exist.
+     NUM_CLASSES = 3  #@Treeins: classes unclassified, non-tree and tree
+-    NUM_CLASSES_sem = 6
+-    NUM_CLASSES_count = 5  # @Treeins: 2 classes without unclassified
++    NUM_CLASSES_sem = 5
++    # Unused in THIS copy of final_eval (mIoU below divides by len(sem_classcount_final)
++    # instead), but the sibling copies do `sum(iou_list) / NUM_CLASSES_count` -- see
++    # treeins.py:187 and npm3d_4class.py:186. Keeping a stale 5 here would silently
++    # divide the headline metric by the wrong number the moment anyone copies that line.
++    NUM_CLASSES_count = 4  # @Treeins: semantic classes excluding unclassified
+     # class index for instance segmenatation
+     ins_classcount = [2]  # @Treeins
+     # class index for stuff segmentation
+     stuff_classcount = [1]  # @Treeins
+     # class index for semantic segmenatation
+-    sem_classcount = [1, 2, 3, 4, 5]  # @Treeins
+-    sem_classcount_remove_ground = [1, 3, 4, 5]
++    sem_classcount = [1, 2, 3, 4]  # @Treeins
++    sem_classcount_remove_ground = [1, 3, 4]
+     #class index for semantic classes with gt points
+     sem_classcount_have = []
+     stuff_classes = [1,2]
+-    thing_classes = [3,4,5]
++    thing_classes = [3,4]
+ 
+     # log directory
+     # file_path = '/scratch2/torch-points3d/outputs/2021-10-20/06-19-43/eval/2021-10-26_14-27-55/'
+diff --git a/PointCloudSegmentation/torch_points3d/datasets/segmentation/treeins_set1.py b/PointCloudSegmentation/torch_points3d/datasets/segmentation/treeins_set1.py
+index da8e53f..5242246 100644
+--- a/PointCloudSegmentation/torch_points3d/datasets/segmentation/treeins_set1.py
++++ b/PointCloudSegmentation/torch_points3d/datasets/segmentation/treeins_set1.py
+@@ -32,13 +32,15 @@ log = logging.getLogger(__name__)
+ 
+ 
+ #@Treeins: two semantic segmentation classes: non-tree and tree
+-Treeins_NUM_CLASSES = 5
++# LOCAL PATCH (SegmentedForests): 5 -> 4 classes. Upstream class 4 "branches" has no
++# counterpart in the SegmentedForests labelling, so nothing ever maps to it; leaving it
++# declared would train a head for a class that cannot occur. See patches/README.md.
++Treeins_NUM_CLASSES = 4
+ INV_OBJECT_LABEL = {
+     0: "low_vegetation",
+     1: "ground",
+     2: "stem_points",
+     3: "live_branches",
+-    4: "branches",
+ }
+ 
+ OBJECT_COLOR = np.asarray(
+@@ -47,7 +49,6 @@ OBJECT_COLOR = np.asarray(
+         [95, 156, 196],  # 'ground' .-> . blue
+         [179, 116, 81],  # 'stem_points'  ->  brown
+         [241, 149, 131],  # 'live_branches'  ->  salmon
+-        [81, 163, 148],  # 'branches'  ->  bluegreen
+         [0, 0, 0],  # unlabelled .->. black
+     ]
+ )
+diff --git a/PointCloudSegmentation/torch_points3d/models/panoptic/PointGroup3heads_ts.py b/PointCloudSegmentation/torch_points3d/models/panoptic/PointGroup3heads_ts.py
+new file mode 100644
+index 0000000..d265bb0
+--- /dev/null
++++ b/PointCloudSegmentation/torch_points3d/models/panoptic/PointGroup3heads_ts.py
+@@ -0,0 +1,829 @@
++r"""PointGroup3heads on the SparseConv3d backbone (TorchSparse 1.4).
++
++LOCAL ADDITION (SegmentedForests). A near-copy of ``PointGroup3heads.py``, differing only
++in the backbone application it builds against: four lines, marked ``# TS:`` below.
++
++**Why a copy and not an edit.** ``Minkowski(...)`` and ``SparseConv3d(...)`` are not two
++wrappers over one implementation -- they resolve the U-Net blocks against different
++modules:
++
++    applications/minkowski.py:9      from ...modules.MinkowskiEngine.api_modules import *
++    applications/sparseconv3d.py:11  from ...modules.SparseConv3d.modules import *
++
++and both then set ``modules_lib = sys.modules[__name__]``, so ``module_name: ResNetDown``
++in the yaml resolves to a *different class* in each. Editing the original in place would
++therefore change the MinkowskiEngine path as well, and the baseline recorded in
++``docs/train_logs.md`` (``Model size = 11872126``, the module tree) would stop being a
++valid reference.
++
++**MinkowskiEngine remains the default.** This file is reached only by asking for it:
++
++    python train.py ... model_name=PointGroup-PAPER      # MinkowskiEngine (default)
++    python train.py ... model_name=PointGroup-PAPER-TS   # this file, TorchSparse 1.4
++
++**Gotcha.** ``SPARSE_BACKEND`` in the environment silently overrides the ``backend`` key
++below (``applications/sparseconv3d.py:59-62``). If it is set, this file will not run
++TorchSparse regardless of the config. Unset it and select by ``model_name``.
++
++Everything else -- the three heads, clustering, scoring, losses -- is untouched and
++backend-agnostic: the model only ever reads ``.x`` off the backbone output. See
++``docs/backbone_torchsparse_1.4.md``.
++"""
++import torch
++import os
++from torch_points_kernels import region_grow
++from torch_geometric.data import Data
++from torch_scatter import scatter
++import random
++import numpy as np
++
++from torch_points3d.datasets.segmentation import IGNORE_LABEL
++from torch_points3d.models.base_model import BaseModel
++from torch_points3d.applications.sparseconv3d import SparseConv3d  # TS: was applications.minkowski.Minkowski
++from torch_points3d.core.common_modules import Seq, MLP, FastBatchNorm1d
++from torch_points3d.core.losses import offset_loss, instance_iou_loss, mask_loss, instance_ious, discriminative_loss
++from torch_points3d.core.data_transform import GridSampling3D
++from .structure_3heads import PanopticLabels, PanopticResults
++from torch_points3d.utils import hdbscan_cluster, meanshift_cluster
++from torch_points3d.utils import is_list
++from torch_points3d.utils import hdbscan_cluster
++from os.path import exists, join
++from .ply import read_ply, write_ply
++
++class PointGroup3heads(BaseModel):
++    __REQUIRED_DATA__ = [
++        "pos",
++    ]
++
++    __REQUIRED_LABELS__ = list(PanopticLabels._fields)
++
++    def __init__(self, option, model_type, dataset, modules):
++        super(PointGroup3heads, self).__init__(option)
++        backbone_options = option.get("backbone", {"architecture": "unet"})
++        # TS: all three sparse networks MUST share one backend -- set_backend() rebinds
++        # module-level globals in modules/SparseConv3d/nn/__init__.py, so the last call
++        # would otherwise decide the backend for all of them.
++        _backend = option.get("backend", "torchsparse")
++        self.Backbone = SparseConv3d(
++            backbone_options.get("architecture", "unet"),
++            input_nc=dataset.feature_dimension,
++            num_layers=4,
++            config=backbone_options.get("config", {}),
++            backend=_backend,
++        )
++
++        self._scorer_type = option.get("scorer_type", None)
++        # cluster_voxel_size = option.get("cluster_voxel_size", 0.05)
++        #TODO look at how to do back projection of GridSampling3D
++        cluster_voxel_size = False
++        if cluster_voxel_size:
++            self._voxelizer = GridSampling3D(cluster_voxel_size, quantize_coords=True, mode="mean", return_inverse=True)
++        else:
++            self._voxelizer = None
++        # TS: ScorerUnet is the one this config actually uses (scorer_type: "unet").
++        self.ScorerUnet = SparseConv3d(
++            "unet", input_nc=self.Backbone.output_nc, num_layers=4,
++            config=option.scorer_unet, backend=_backend,
++        )
++        # TS: built but never called at scorer_type "unet" -- which is fortunate, because
++        # SparseConv3dEncoder.forward reads data.C[:, 0] as the batch index
++        # (sparseconv3d.py:164). That is correct for MinkowskiEngine's [batch,x,y,z]
++        # coordinate layout but WRONG for torchsparse's [x,y,z,batch]; it would read the
++        # x coordinate instead. Fix that line before switching to scorer_type "encoder".
++        self.ScorerEncoder = SparseConv3d(
++            "encoder", input_nc=self.Backbone.output_nc, num_layers=4,
++            config=option.scorer_encoder, backend=_backend,
++        )
++        self.ScorerMLP = MLP([self.Backbone.output_nc, self.Backbone.output_nc, self.ScorerUnet.output_nc])
++        self.ScorerHead = Seq().append(torch.nn.Linear(self.ScorerUnet.output_nc, 1)).append(torch.nn.Sigmoid())
++
++        self.mask_supervise = option.get("mask_supervise", False)
++        if self.mask_supervise:
++            self.MaskScore = (
++                Seq()
++                .append(torch.nn.Linear(self.ScorerUnet.output_nc, self.ScorerUnet.output_nc))
++                .append(torch.nn.ReLU())
++                .append(torch.nn.Linear(self.ScorerUnet.output_nc, 1))
++            )
++        self.use_score_net = option.get("use_score_net", True)
++        self.use_mask_filter_score_feature = option.get("use_mask_filter_score_feature", False)
++        self.use_mask_filter_score_feature_start_epoch = option.get("use_mask_filter_score_feature_start_epoch", 200)
++        self.mask_filter_score_feature_thre = option.get("mask_filter_score_feature_thre", 0.5)
++
++        self.cal_iou_based_on_mask = option.get("cal_iou_based_on_mask", False)
++        self.cal_iou_based_on_mask_start_epoch = option.get("cal_iou_based_on_mask_start_epoch", 200)
++
++        self.Offset = Seq().append(MLP([self.Backbone.output_nc, self.Backbone.output_nc], bias=False))
++        self.Offset.append(torch.nn.Linear(self.Backbone.output_nc, 3))
++
++
++        self.Embed = Seq().append(MLP([self.Backbone.output_nc, self.Backbone.output_nc], bias=False))
++        self.Embed.append(torch.nn.Linear(self.Backbone.output_nc, option.get("embed_dim", 5)))
++
++        self.Semantic = (
++            Seq()
++            .append(MLP([self.Backbone.output_nc, self.Backbone.output_nc], bias=False))
++            .append(torch.nn.Linear(self.Backbone.output_nc, dataset.num_classes))
++        )
++        self.LogSoftLay = (
++            Seq()
++            .append(torch.nn.LogSoftmax(dim=-1))
++        )
++        self.loss_names = ["loss", "offset_norm_loss", "offset_dir_loss",  "ins_loss", "ins_var_loss", "ins_dist_loss", "ins_reg_loss","semantic_loss", "score_loss", "mask_loss"]
++        self.use_binary_loss = option.get("use_binary_loss", False)
++        if self.use_binary_loss:
++            self.BiSemantic = (
++                Seq()
++                .append(torch.nn.Linear(dataset.num_classes, 2))
++                .append(torch.nn.LogSoftmax(dim=-1))
++            )
++            self.loss_names = ["loss", "offset_norm_loss", "offset_dir_loss",  "ins_loss", "ins_var_loss", "ins_dist_loss", "ins_reg_loss","semantic_loss", "score_loss", "mask_loss", "semantic_loss_bi"]
++        
++        stuff_classes = dataset.stuff_classes
++        if is_list(stuff_classes):
++            stuff_classes = torch.Tensor(stuff_classes).long()
++        thing_classes = dataset.thing_classes
++        if is_list(thing_classes):
++            thing_classes = torch.Tensor(thing_classes).long()
++        self._stuff_classes = torch.cat([torch.tensor([IGNORE_LABEL]), stuff_classes])
++        self._thing_classes = thing_classes
++        
++        self._weight_per_point = option.get("weight_per_point", None)
++
++    def get_opt_mergeTh(self):
++        """returns configuration"""
++        if self.opt.block_merge_th:
++            return self.opt.block_merge_th
++        else:
++            return 0.01
++    
++    def set_input(self, data, device):
++        self.raw_pos = data.pos.to(device)
++        self.input = data
++        all_labels = {l: data[l].to(device) for l in self.__REQUIRED_LABELS__}
++        self.labels = PanopticLabels(**all_labels)
++
++    def forward(self, epoch=-1, **kwargs):
++        # Backbone
++        backbone_features = self.Backbone(self.input).x # [N, 16]
++
++        # Semantic, offset and embedding heads
++        semantic_logits = self.Semantic(backbone_features) # [N, 9]
++        semantic_logits = self.LogSoftLay(semantic_logits)
++        bi_semantic_logits = None
++        if self.use_binary_loss:
++            bi_semantic_logits = self.BiSemantic(semantic_logits)
++        offset_logits = self.Offset(backbone_features) # [N, 3]
++        embed_logits = self.Embed(backbone_features) # [N, 5]
++
++        # Grouping and scoring
++        cluster_scores = None
++        mask_scores = None
++        all_clusters = None # list of clusters (point idx)
++        cluster_type = None # 0 for cluster, 1 for vote
++        if self.use_score_net: # and epoch > self.opt.prepare_epoch:
++            if epoch > self.opt.prepare_epoch:   # Active by default epoch > -1: #
++                if self.opt.cluster_type == 1:
++                    all_clusters, cluster_type = self._cluster(semantic_logits, offset_logits)
++                elif self.opt.cluster_type == 2:
++                    all_clusters, cluster_type = self._cluster2(semantic_logits, offset_logits)
++                elif self.opt.cluster_type == 3:
++                    all_clusters, cluster_type = self._cluster3(semantic_logits, embed_logits)
++                elif self.opt.cluster_type == 4:
++                    all_clusters, cluster_type = self._cluster4(semantic_logits, embed_logits)
++                elif self.opt.cluster_type == 5:
++                    all_clusters, cluster_type = self._cluster5(semantic_logits, offset_logits, embed_logits)
++                elif self.opt.cluster_type == 6:
++                    all_clusters, cluster_type = self._cluster6(semantic_logits, offset_logits, embed_logits)
++                elif self.opt.cluster_type == 7: #set1_classes5/set2/set3
++                    all_clusters, cluster_type = self._cluster7(semantic_logits, offset_logits, embed_logits)
++                if len(all_clusters):
++                    cluster_scores, mask_scores = self._compute_score(epoch, all_clusters, backbone_features, semantic_logits)
++                    #cluster_scores, mask_scores = self._compute_score_batch(epoch, all_clusters, cluster_type, backbone_features, semantic_logits)
++                    #cluster_scores, mask_scores = self._compute_real_score(epoch, all_clusters, cluster_type, backbone_features, semantic_logits)
++        else:
++            with torch.no_grad():
++                if epoch % 1 == 0:
++                    if self.opt.cluster_type == 1:
++                        all_clusters, cluster_type = self._cluster(semantic_logits, offset_logits)
++                    elif self.opt.cluster_type == 2:
++                        all_clusters, cluster_type = self._cluster2(semantic_logits, offset_logits)
++                    elif self.opt.cluster_type == 3:
++                        all_clusters, cluster_type = self._cluster3(semantic_logits, embed_logits)
++                    elif self.opt.cluster_type == 4:
++                        all_clusters, cluster_type = self._cluster4(semantic_logits, embed_logits)
++                    elif self.opt.cluster_type == 5:
++                        all_clusters, cluster_type = self._cluster5(semantic_logits, offset_logits, embed_logits)
++                    elif self.opt.cluster_type == 6:
++                        all_clusters, cluster_type = self._cluster6(semantic_logits, offset_logits, embed_logits)
++                    elif self.opt.cluster_type == 7:
++                        all_clusters, cluster_type = self._cluster7(semantic_logits, offset_logits, embed_logits)
++                
++        self.output = PanopticResults(
++            semantic_logits=semantic_logits,
++            bi_semantic_logits=bi_semantic_logits,
++            offset_logits=offset_logits,
++            embed_logits=embed_logits,
++            clusters=all_clusters,
++            cluster_scores=cluster_scores,
++            mask_scores=mask_scores,
++            cluster_type=cluster_type,
++        )
++
++        # Sets visual data for debugging
++        #with torch.no_grad():
++        #    self._dump_visuals(epoch)
++
++    def _cluster(self, semantic_logits, offset_logits):
++        """ Compute clusters from positions and votes """
++        predicted_labels = torch.max(semantic_logits, 1)[1] # [N]
++        clusters_votes = region_grow(
++            self.raw_pos + offset_logits,
++            predicted_labels,
++            self.input.batch.to(self.device),
++            ignore_labels=self._stuff_classes.to(self.device),
++            radius=self.opt.cluster_radius_search,
++            nsample=200,
++            min_cluster_size=10
++        )
++        #clusters_votes = []
++
++        all_clusters = clusters_votes
++        all_clusters = [c.to(self.device) for c in all_clusters]
++        cluster_type = torch.zeros(len(all_clusters), dtype=torch.uint8).to(self.device)
++        return all_clusters, cluster_type
++    
++    def _cluster2(self, semantic_logits, offset_logits):
++        """ Compute clusters from positions and votes """
++        predicted_labels = torch.max(semantic_logits, 1)[1] # [N]
++        clusters_pos = region_grow(
++            self.raw_pos,
++            predicted_labels,
++            self.input.batch.to(self.device),
++            ignore_labels=self._stuff_classes.to(self.device),
++            radius=self.opt.cluster_radius_search,
++            min_cluster_size=10
++        )
++        #clusters_pos = []
++        clusters_votes = region_grow(
++            self.raw_pos + offset_logits,
++            predicted_labels,
++            self.input.batch.to(self.device),
++            ignore_labels=self._stuff_classes.to(self.device),
++            radius=self.opt.cluster_radius_search,
++            nsample=200,
++            min_cluster_size=10
++        )
++        #clusters_votes = []
++
++        all_clusters = clusters_pos + clusters_votes
++        all_clusters = [c.to(self.device) for c in all_clusters]
++        cluster_type = torch.zeros(len(all_clusters), dtype=torch.uint8).to(self.device)
++        if len(clusters_pos):
++            cluster_type[len(clusters_pos) :] = 1
++        return all_clusters, cluster_type
++
++    #clustering based on embedding features + meanshift
++    def _cluster3(self, semantic_logits, embed_logits):
++        """ Compute clusters"""
++        #remove stuff points
++        N = embed_logits.shape[0]  #.cpu().detach().numpy().shape[0]
++        predicted_labels = torch.max(semantic_logits, 1)[1] #.cpu().detach().numpy() # [N]
++        ind = torch.arange(0, N)
++        unique_predicted_labels = torch.unique(predicted_labels) #np.unique(predicted_labels)
++        ignore_labels=self._stuff_classes.to(self.device)  #.cpu().detach().numpy()
++        label_mask = torch.ones(predicted_labels.shape[0], dtype=torch.bool) #.cpu().detach().numpy()
++        for l in unique_predicted_labels:
++            if l in ignore_labels:
++                # Build clusters for a given label (ignore other points)
++                label_mask_l = predicted_labels == l
++                label_mask[label_mask_l] = False
++        local_ind = ind[label_mask]
++        label_batch = self.input.batch[label_mask]  #.cpu().detach().numpy()
++        unique_in_batch = torch.unique(label_batch)
++        
++        #Clustering based on embeddings
++        embeds_u = embed_logits[label_mask]  #.cpu().detach().numpy()
++        
++        #clusters_embed, cluster_type_embeds = hdbscan_cluster.cluster_single(embeds_u, unique_in_batch, label_batch, local_ind, 0)
++        clusters_embed, cluster_type_embeds = meanshift_cluster.cluster_single(embeds_u, unique_in_batch, label_batch, local_ind, 0, self.opt.bandwidth)
++
++        ###### Combine the two groups of clusters ######
++        all_clusters = clusters_embed
++        all_clusters = [c.to(self.device) for c in all_clusters]
++        cluster_type = torch.zeros(len(all_clusters), dtype=torch.uint8).to(self.device)
++        return all_clusters, cluster_type
++    
++    #clustering based on embedding features + meanshift U original coordinates + regiongrowing
++    def _cluster4(self, semantic_logits, embed_logits):
++        """ Compute clusters from positions and votes """
++
++        ###### Cluster using original position with predicted semantic labels ######
++        predicted_labels = torch.max(semantic_logits, 1)[1] # [N]
++        clusters_pos = []
++        clusters_pos = region_grow(
++            self.raw_pos,
++            predicted_labels,
++            self.input.batch.to(self.device),
++            ignore_labels=self._stuff_classes.to(self.device),
++            radius=self.opt.cluster_radius_search,
++            min_cluster_size=10
++        )
++        ###### Cluster using embedding without predicted semantic labels ######
++        #remove stuff points
++        N = embed_logits.shape[0]  #.cpu().detach().numpy().shape[0]
++        ind = torch.arange(0, N)
++        unique_predicted_labels = torch.unique(predicted_labels) #np.unique(predicted_labels)
++        ignore_labels=self._stuff_classes.to(self.device)  #.cpu().detach().numpy()
++        label_mask = torch.ones(predicted_labels.shape[0], dtype=torch.bool) #.cpu().detach().numpy()
++        for l in unique_predicted_labels:
++            if l in ignore_labels:
++                # Build clusters for a given label (ignore other points)
++                label_mask_l = predicted_labels == l
++                label_mask[label_mask_l] = False
++        local_ind = ind[label_mask]
++        label_batch = self.input.batch[label_mask]  #.cpu().detach().numpy()
++        unique_in_batch = torch.unique(label_batch)
++        
++        #Clustering based on embeddings
++        embeds_u = embed_logits[label_mask]  #.cpu().detach().numpy()
++        clusters_embed, cluster_type_embeds = meanshift_cluster.cluster_single(embeds_u, unique_in_batch, label_batch, local_ind, 1, self.opt.bandwidth)
++
++
++        ###### Combine the two groups of clusters ######
++        all_clusters = []
++        cluster_type = []
++        all_clusters = all_clusters + clusters_pos
++        all_clusters = all_clusters + clusters_embed
++        cluster_type = cluster_type + list(np.zeros(len(clusters_pos), dtype=np.uint8))
++        cluster_type = cluster_type + cluster_type_embeds
++        all_clusters = [c.clone().detach().to(self.device) for c in all_clusters]
++        cluster_type = torch.tensor(cluster_type).to(self.device)
++        return all_clusters, cluster_type
++    
++    #clustering based on embedding features + meanshift U shifted coordinates + regiongrowing
++    def _cluster5(self, semantic_logits, offset_logits, embed_logits):
++        """ Compute clusters from positions and votes """
++        ###### Cluster using original position with predicted semantic labels ######
++        predicted_labels = torch.max(semantic_logits, 1)[1] # [N]
++        clusters_pos = []
++        clusters_pos = region_grow(
++            self.raw_pos + offset_logits,
++            predicted_labels,
++            self.input.batch.to(self.device),
++            ignore_labels=self._stuff_classes.to(self.device),
++            radius=self.opt.cluster_radius_search,
++            nsample=200,
++            min_cluster_size=10
++        )
++        ###### Cluster using embedding without predicted semantic labels ######
++        #remove stuff points
++        N = embed_logits.shape[0]  #.cpu().detach().numpy().shape[0]
++        ind = torch.arange(0, N)
++        unique_predicted_labels = torch.unique(predicted_labels) #np.unique(predicted_labels)
++        ignore_labels=self._stuff_classes.to(self.device)  #.cpu().detach().numpy()
++        label_mask = torch.ones(predicted_labels.shape[0], dtype=torch.bool) #.cpu().detach().numpy()
++        for l in unique_predicted_labels:
++            if l in ignore_labels:
++                # Build clusters for a given label (ignore other points)
++                label_mask_l = predicted_labels == l
++                label_mask[label_mask_l] = False
++        local_ind = ind[label_mask]
++        label_batch = self.input.batch[label_mask]  #.cpu().detach().numpy()
++        unique_in_batch = torch.unique(label_batch)
++        
++        #Clustering based on embeddings
++        embeds_u = embed_logits[label_mask]  #.cpu().detach().numpy()
++        clusters_embed, cluster_type_embeds = meanshift_cluster.cluster_single(embeds_u, unique_in_batch, label_batch, local_ind, 1, self.opt.bandwidth)
++
++
++        ###### Combine the two groups of clusters ######
++        all_clusters = []
++        cluster_type = []
++        all_clusters = all_clusters + clusters_pos
++        all_clusters = all_clusters + clusters_embed
++        cluster_type = cluster_type + list(np.zeros(len(clusters_pos), dtype=np.uint8))
++        cluster_type = cluster_type + cluster_type_embeds
++        all_clusters = [c.clone().detach().to(self.device) for c in all_clusters]
++        cluster_type = torch.tensor(cluster_type).to(self.device)
++        return all_clusters, cluster_type
++
++    def _cluster6(self, semantic_logits, offset_logits, embed_logits):
++        """ Compute clusters from positions and votes """
++        predicted_labels = torch.max(semantic_logits, 1)[1] # [N]
++        clusters_pos = region_grow(
++            self.raw_pos,
++            predicted_labels,
++            self.input.batch.to(self.device),
++            ignore_labels=self._stuff_classes.to(self.device),
++            radius=self.opt.cluster_radius_search,
++            min_cluster_size=10
++        )
++        #clusters_pos = []
++        clusters_votes = region_grow(
++            self.raw_pos + offset_logits,
++            predicted_labels,
++            self.input.batch.to(self.device),
++            ignore_labels=self._stuff_classes.to(self.device),
++            radius=self.opt.cluster_radius_search,
++            nsample=200,
++            min_cluster_size=10
++        )
++        ###### Cluster using embedding without predicted semantic labels ######
++        #remove stuff points
++        N = embed_logits.shape[0]  #.cpu().detach().numpy().shape[0]
++        ind = torch.arange(0, N)
++        unique_predicted_labels = torch.unique(predicted_labels) #np.unique(predicted_labels)
++        ignore_labels=self._stuff_classes.to(self.device)  #.cpu().detach().numpy()
++        label_mask = torch.ones(predicted_labels.shape[0], dtype=torch.bool) #.cpu().detach().numpy()
++        for l in unique_predicted_labels:
++            if l in ignore_labels:
++                # Build clusters for a given label (ignore other points)
++                label_mask_l = predicted_labels == l
++                label_mask[label_mask_l] = False
++        local_ind = ind[label_mask]
++        label_batch = self.input.batch[label_mask]  #.cpu().detach().numpy()
++        unique_in_batch = torch.unique(label_batch)
++        
++        #Clustering based on embeddings
++        embeds_u = embed_logits[label_mask]  #.cpu().detach().numpy()
++        clusters_embed, cluster_type_embeds = meanshift_cluster.cluster_single(embeds_u, unique_in_batch, label_batch, local_ind, 2, self.opt.bandwidth)
++
++
++        ###### Combine the two groups of clusters ######
++        all_clusters = []
++        cluster_type = []
++        all_clusters = all_clusters + clusters_pos
++        all_clusters = all_clusters + clusters_votes
++        all_clusters = all_clusters + clusters_embed
++        cluster_type = cluster_type + list(np.zeros(len(clusters_pos), dtype=np.uint8))
++        cluster_type = cluster_type + list(np.ones(len(clusters_votes), dtype=np.uint8))
++        cluster_type = cluster_type + cluster_type_embeds
++        all_clusters = [c.clone().detach().to(self.device) for c in all_clusters]
++        cluster_type = torch.tensor(cluster_type).to(self.device)
++
++        return all_clusters, cluster_type
++
++
++    def _cluster7(self, semantic_logits, offset_logits, embed_logits):
++        """ Compute clusters from positions and votes """
++        ###### Cluster using original position with predicted semantic labels ######
++        predicted_labels = torch.max(semantic_logits, 1)[1] # [N]
++        predicted_labels_copy = predicted_labels.detach().clone()
++        #map the predicted semantic labels to the same label : trees
++        min_thing_label = torch.min(self._thing_classes)
++        for i in self._thing_classes:
++            predicted_labels[predicted_labels_copy==i] = min_thing_label.to(self.device)
++        clusters_pos = []
++        clusters_pos = region_grow(
++            self.raw_pos + offset_logits,
++            predicted_labels,
++            self.input.batch.to(self.device),
++            ignore_labels=self._stuff_classes.to(self.device),
++            radius=self.opt.cluster_radius_search,
++            nsample=200,
++            min_cluster_size=10
++        )
++        ###### Cluster using embedding without predicted semantic labels ######
++        #remove stuff points
++        N = embed_logits.shape[0]  #.cpu().detach().numpy().shape[0]
++        ind = torch.arange(0, N)
++        unique_predicted_labels = torch.unique(predicted_labels) #np.unique(predicted_labels)
++        ignore_labels=self._stuff_classes.to(self.device)  #.cpu().detach().numpy()
++        label_mask = torch.ones(predicted_labels.shape[0], dtype=torch.bool) #.cpu().detach().numpy()
++        for l in unique_predicted_labels:
++            if l in ignore_labels:
++                # Build clusters for a given label (ignore other points)
++                label_mask_l = predicted_labels == l
++                label_mask[label_mask_l] = False
++        local_ind = ind[label_mask]
++        label_batch = self.input.batch[label_mask]  #.cpu().detach().numpy()
++        unique_in_batch = torch.unique(label_batch)
++        
++        #Clustering based on embeddings
++        embeds_u = embed_logits[label_mask]  #.cpu().detach().numpy()
++        clusters_embed, cluster_type_embeds = meanshift_cluster.cluster_single(embeds_u, unique_in_batch, label_batch, local_ind, 1, self.opt.bandwidth)
++
++
++        ###### Combine the two groups of clusters ######
++        all_clusters = []
++        cluster_type = []
++        all_clusters = all_clusters + clusters_pos
++        all_clusters = all_clusters + clusters_embed
++        cluster_type = cluster_type + list(np.zeros(len(clusters_pos), dtype=np.uint8))
++        cluster_type = cluster_type + cluster_type_embeds
++        all_clusters = [c.clone().detach().to(self.device) for c in all_clusters]
++        cluster_type = torch.tensor(cluster_type).to(self.device)
++        return all_clusters, cluster_type
++    
++    def _compute_score(self, epoch, all_clusters, backbone_features, semantic_logits):
++        """ Score the clusters """
++        mask_scores = None
++        if self._scorer_type: # unet
++            # Assemble batches
++            x = [] # backbone features
++            coords = [] # input coords
++            batch = [] 
++            pos = []
++            for i, cluster in enumerate(all_clusters):
++                x.append(backbone_features[cluster])
++                coords.append(self.input.coords[cluster])
++                batch.append(i * torch.ones(cluster.shape[0]))
++                pos.append(self.input.pos[cluster])
++            batch_cluster = Data(x=torch.cat(x), coords=torch.cat(coords), batch=torch.cat(batch),)
++
++            # Voxelise if required
++            if self._voxelizer:
++                batch_cluster.pos = torch.cat(pos)
++                batch_cluster = batch_cluster.to(self.device)
++                batch_cluster = self._voxelizer(batch_cluster)
++
++            # Score
++            batch_cluster = batch_cluster.to("cpu")
++            if self._scorer_type == "MLP":
++                score_backbone_out = self.ScorerMLP(batch_cluster.x.to(self.device))
++                cluster_feats = scatter(
++                    score_backbone_out, batch_cluster.batch.long().to(self.device), dim=0, reduce="max"
++                )
++            elif self._scorer_type == "encoder":
++                score_backbone_out = self.ScorerEncoder(batch_cluster)
++                cluster_feats = score_backbone_out.x
++            else:
++                score_backbone_out = self.ScorerUnet(batch_cluster)
++                if self.mask_supervise:
++                    mask_scores = self.MaskScore(score_backbone_out.x) # [point num of all proposals (voxelized), 1]
++                    
++                    if self.use_mask_filter_score_feature and epoch > self.use_mask_filter_score_feature_start_epoch:
++                        mask_index_select = torch.ones_like(mask_scores)
++                        mask_index_select[torch.sigmoid(mask_scores) < self.mask_filter_score_feature_thre] = 0.
++                        score_backbone_out.x = score_backbone_out.x * mask_index_select
++                    # mask_scores = mask_scores[batch_cluster.inverse_indices] # [point num of all proposals, 1]
++                
++                cluster_feats = scatter(
++                    score_backbone_out.x, batch_cluster.batch.long().to(self.device), dim=0, reduce="max"
++                ) # [num_cluster, 16]
++
++            cluster_scores = self.ScorerHead(cluster_feats).squeeze(-1) # [num_cluster, 1]
++            
++        else:
++            # Use semantic certainty as cluster confidence
++            with torch.no_grad():
++                cluster_semantic = []
++                batch = []
++                for i, cluster in enumerate(all_clusters):
++                    cluster_semantic.append(semantic_logits[cluster, :])
++                    batch.append(i * torch.ones(cluster.shape[0]))
++                cluster_semantic = torch.cat(cluster_semantic)
++                batch = torch.cat(batch)
++                cluster_semantic = scatter(cluster_semantic, batch.long().to(self.device), dim=0, reduce="mean")
++                cluster_scores = torch.max(torch.exp(cluster_semantic), 1)[0]
++        return cluster_scores, mask_scores
++ 
++    def _compute_score_batch(self, epoch, all_clusters, cluster_type, backbone_features, semantic_logits):
++        """ Score the clusters """
++        mask_scores = None
++        cluster_scores = torch.zeros(len(all_clusters)).to(self.device)
++        cluster_type_unique = torch.unique(cluster_type)
++        for type_i in cluster_type_unique:
++            type_mask_l = cluster_type == type_i
++            type_mask_l = torch.where(type_mask_l)[0]
++            if self._scorer_type: # unet
++                # Assemble batches
++                x = [] # backbone features
++                coords = [] # input coords
++                batch = [] 
++                pos = []
++                for i, mask_i in enumerate(type_mask_l):
++                    cluster = all_clusters[mask_i]
++                    #for i, cluster in enumerate(all_clusters):
++                    x.append(backbone_features[cluster])
++                    coords.append(self.input.coords[cluster])
++                    batch.append(i * torch.ones(cluster.shape[0]))
++                    pos.append(self.input.pos[cluster])
++                batch_cluster = Data(x=torch.cat(x), coords=torch.cat(coords), batch=torch.cat(batch),)
++
++                # Voxelise if required
++                if self._voxelizer:
++                    batch_cluster.pos = torch.cat(pos)
++                    batch_cluster = batch_cluster.to(self.device)
++                    batch_cluster = self._voxelizer(batch_cluster)
++
++                # Score
++                batch_cluster = batch_cluster.to("cpu")
++                if self._scorer_type == "MLP":
++                    score_backbone_out = self.ScorerMLP(batch_cluster.x.to(self.device))
++                    cluster_feats = scatter(
++                        score_backbone_out, batch_cluster.batch.long().to(self.device), dim=0, reduce="max"
++                    )
++                elif self._scorer_type == "encoder":
++                    score_backbone_out = self.ScorerEncoder(batch_cluster)
++                    cluster_feats = score_backbone_out.x
++                else:
++                    score_backbone_out = self.ScorerUnet(batch_cluster)
++                    if self.mask_supervise:
++                        mask_scores = self.MaskScore(score_backbone_out.x) # [point num of all proposals (voxelized), 1]
++                        
++                        if self.use_mask_filter_score_feature and epoch > self.use_mask_filter_score_feature_start_epoch:
++                            mask_index_select = torch.ones_like(mask_scores)
++                            mask_index_select[torch.sigmoid(mask_scores) < self.mask_filter_score_feature_thre] = 0.
++                            score_backbone_out.x = score_backbone_out.x * mask_index_select
++                        # mask_scores = mask_scores[batch_cluster.inverse_indices] # [point num of all proposals, 1]
++                    
++                    cluster_feats = scatter(
++                        score_backbone_out.x, batch_cluster.batch.long().to(self.device), dim=0, reduce="max"
++                    ) # [num_cluster, 16]
++
++                cluster_scores[type_mask_l] = self.ScorerHead(cluster_feats).squeeze(-1) # [num_cluster, 1]
++                
++            else:
++                # Use semantic certainty as cluster confidence
++                with torch.no_grad():
++                    cluster_semantic = []
++                    batch = []
++                    for i, cluster in enumerate(all_clusters):
++                        cluster_semantic.append(semantic_logits[cluster, :])
++                        batch.append(i * torch.ones(cluster.shape[0]))
++                    cluster_semantic = torch.cat(cluster_semantic)
++                    batch = torch.cat(batch)
++                    cluster_semantic = scatter(cluster_semantic, batch.long().to(self.device), dim=0, reduce="mean")
++                    cluster_scores = torch.max(torch.exp(cluster_semantic), 1)[0]
++        return cluster_scores, mask_scores
++
++    def _compute_real_score(self, epoch, all_clusters, cluster_type, backbone_features, semantic_logits):
++        
++        mask_scores = None
++        cluster_scores = torch.zeros(len(all_clusters))
++        if self.input.num_instances>0:
++            ious = instance_ious(
++                    all_clusters,
++                    None,
++                    self.input.instance_labels.to(self.device),
++                    self.input.batch.to(self.device),
++                    None,
++                    cal_iou_based_on_mask=False
++                )
++            ious = ious.max(1)[0]
++            min_iou_threshold = 0 #0.25
++            max_iou_threshold = 1 #0.75
++            lower_mask = ious < min_iou_threshold
++            higher_mask = ious > max_iou_threshold
++            middle_mask = torch.logical_and(torch.logical_not(lower_mask), torch.logical_not(higher_mask))
++            assert torch.sum(lower_mask + higher_mask + middle_mask) == ious.shape[0]
++            cluster_scores = torch.zeros_like(ious)
++            iou_middle = ious[middle_mask]
++            cluster_scores[higher_mask] = 1
++            cluster_scores[middle_mask] = (iou_middle - min_iou_threshold) / (max_iou_threshold - min_iou_threshold)
++        return cluster_scores, mask_scores
++    
++    def _compute_loss(self, epoch):
++        # Semantic loss
++        attr = getattr(self, 'weight_classes', None)
++        if self._weight_per_point != None:
++            if self._weight_per_point == 'height':
++                # add weights for each point
++                above_height = self.raw_pos[:,-1]-self.raw_pos[:,-1].min()
++                sample_weight = above_height/(above_height.mean()+np.finfo(np.float64).eps)
++                sample_weight = torch.exp(-sample_weight)
++                #sample_weight = torch.empty((self.labels.y).to(torch.int64).size()).fill_(0.1)
++                self.semantic_loss = torch.nn.functional.nll_loss(
++                        self.output.semantic_logits, (self.labels.y).to(torch.int64), ignore_index=IGNORE_LABEL, reduction='none'
++                    )
++                self.semantic_loss = self.semantic_loss * sample_weight
++                self.semantic_loss = self.semantic_loss.mean()
++        elif attr is not None:
++            self.semantic_loss = torch.nn.functional.nll_loss(
++                self.output.semantic_logits, (self.labels.y).to(torch.int64), weight=self.weight_classes, ignore_index=IGNORE_LABEL
++            )
++        else:
++            self.semantic_loss = torch.nn.functional.nll_loss(
++                self.output.semantic_logits, (self.labels.y).to(torch.int64), ignore_index=IGNORE_LABEL
++            )
++        
++        self.loss = self.opt.loss_weights.semantic * self.semantic_loss
++            
++        if self.use_binary_loss:
++            bi_y = self.labels.y.detach().clone()
++            bi_y[(bi_y[..., None] == self._stuff_classes[1:].to(self.device)).any(-1)] = 0 
++            bi_y[(bi_y[..., None] == self._thing_classes.to(self.device)).any(-1)] = 1 
++            #self.output.bi_semantic_logits = 0
++            self.semantic_loss_bi = torch.nn.functional.nll_loss(
++                    self.output.bi_semantic_logits, (bi_y).to(torch.int64), ignore_index=IGNORE_LABEL
++                )
++            self.loss += self.opt.loss_weights.semantic * self.semantic_loss_bi
++        
++        # Offset loss
++        self.input.instance_mask = self.input.instance_mask.to(self.device)
++        self.input.vote_label = self.input.vote_label.to(self.device)
++        offset_losses = offset_loss(
++            self.output.offset_logits[self.input.instance_mask],
++            self.input.vote_label[self.input.instance_mask],
++            torch.sum(self.input.instance_mask),
++        )
++        for loss_name, loss in offset_losses.items():
++            setattr(self, loss_name, loss)
++            self.loss += self.opt.loss_weights[loss_name] * loss
++        
++        # Embed loss
++        self.input.instance_labels = self.input.instance_labels.to(self.device)
++        self.input.batch = self.input.batch.to(self.device)
++
++        discriminative_losses = discriminative_loss(
++            self.output.embed_logits[self.input.instance_mask],
++            self.input.instance_labels[self.input.instance_mask],
++            self.input.batch[self.input.instance_mask].to(self.device),
++            self.opt.embed_dim
++            )
++        for loss_name, loss in discriminative_losses.items():
++            setattr(self, loss_name, loss)
++            if loss_name=="ins_loss":
++                self.loss = self.loss + self.opt.loss_weights.embedding_loss * loss
++
++
++        if self.output.mask_scores is not None:
++            mask_scores_sigmoid = torch.sigmoid(self.output.mask_scores).squeeze()
++        else:
++            mask_scores_sigmoid = None
++            
++        # Calculate iou between each proposal and each GT instance
++        if epoch > self.opt.prepare_epoch and self.use_score_net:
++            if self.cal_iou_based_on_mask and (epoch > self.cal_iou_based_on_mask_start_epoch):
++                ious = instance_ious(
++                    self.output.clusters,
++                    self.output.cluster_scores,
++                    self.input.instance_labels,
++                    self.input.batch,
++                    mask_scores_sigmoid,
++                    cal_iou_based_on_mask=True
++                )
++            else:
++                ious = instance_ious(
++                    self.output.clusters,
++                    self.output.cluster_scores,
++                    self.input.instance_labels,
++                    self.input.batch,
++                    mask_scores_sigmoid,
++                    cal_iou_based_on_mask=False
++                )
++        # Score loss
++        if self.output.cluster_scores is not None and self._scorer_type:
++            self.score_loss = instance_iou_loss(
++                ious,
++                self.output.clusters,
++                self.output.cluster_scores,
++                self.input.instance_labels.to(self.device),
++                self.input.batch.to(self.device),
++                min_iou_threshold=self.opt.min_iou_threshold,
++                max_iou_threshold=self.opt.max_iou_threshold,
++            )
++            self.loss += self.score_loss * self.opt.loss_weights["score_loss"]
++
++        # Mask loss
++        if self.output.mask_scores is not None and self.mask_supervise:
++            self.mask_loss = mask_loss(
++                ious,
++                self.output.clusters,
++                mask_scores_sigmoid,
++                self.input.instance_labels.to(self.device),
++                self.input.batch.to(self.device),
++            )
++            self.loss += self.mask_loss * self.opt.loss_weights["mask_loss"]
++
++    def backward(self, epoch):
++        """Calculate losses, gradients, and update network weights; called in every training iteration"""
++        self._compute_loss(epoch)
++        self.loss.backward()
++
++    def _dump_visuals(self, epoch):
++        if random.random(): # < self.opt.vizual_ratio:
++            if not hasattr(self, "visual_count"):
++                self.visual_count = 0
++            data_visual = Data(
++                pos=self.raw_pos, y=self.input.y, instance_labels=self.input.instance_labels, batch=self.input.batch, vote_label=self.labels.vote_label
++            )
++            data_visual.semantic_pred = torch.max(self.output.semantic_logits, -1)[1]
++            data_visual.vote = self.output.offset_logits
++            nms_idx = self.output.get_instances()
++            if self.output.clusters is not None:
++                data_visual.clusters = [self.output.clusters[i].cpu() for i in nms_idx]
++                data_visual.cluster_type = self.output.cluster_type[nms_idx]
++            if not os.path.exists("viz"):
++                os.mkdir("viz")
++            if not os.path.exists("viz/epoch_%i" % (epoch)):
++                os.mkdir("viz/epoch_%i" % (epoch))
++            #torch.save(data_visual.to("cpu"), "viz/data_e%i_%i.pt" % (epoch, self.visual_count))
++            batch_size = torch.unique(data_visual.batch)
++            for s in batch_size:
++                print(s)
++                batch_mask = data_visual.batch == s
++                example_name='example_{:d}'.format(self.visual_count)
++                val_name = join("viz", "epoch_"+str(epoch), example_name)
++                write_ply(val_name,
++                            [data_visual.pos[batch_mask].detach().cpu().numpy(), 
++                            data_visual.y[batch_mask].detach().cpu().numpy().astype('int32'),
++                            data_visual.instance_labels[batch_mask].detach().cpu().numpy().astype('int32'),
++                            data_visual.vote_label[batch_mask].detach().cpu().numpy(),
++                            data_visual.pos[batch_mask].detach().cpu().numpy()+data_visual.vote_label[batch_mask].detach().cpu().numpy()
++                            ],
++                            ['x', 'y', 'z', 'sem_label', 'ins_label','offset_x', 'offset_y', 'offset_z', 'center_x', 'center_y', 'center_z'])
++                
++            self.visual_count += 1
+diff --git a/PointCloudSegmentation/train.py b/PointCloudSegmentation/train.py
+index c7cbd87..a0c1da2 100644
+--- a/PointCloudSegmentation/train.py
++++ b/PointCloudSegmentation/train.py
+@@ -3,17 +3,22 @@ from hydra.core.global_hydra import GlobalHydra
+ from omegaconf import OmegaConf
+ from torch_points3d.trainer import Trainer
+ import logging
++import debugpy
+ 
+ @hydra.main(config_path="conf", config_name="config")
+ def main(cfg):
++    # debugpy.breakpoint()   # add — process-initiated stop, ignores pathMappings
++
+     
+     numba_logger = logging.getLogger('numba')
+     numba_logger.setLevel(logging.WARNING)
+     OmegaConf.set_struct(cfg, False)  # This allows getattr and hasattr methods to function correctly
+     if cfg.pretty_print:
+         print(OmegaConf.to_yaml(cfg))
+-
++    
+     trainer = Trainer(cfg)
++    print(Trainer)
++    # debugpy.breakpoint()   # add — process-initiated stop, ignores pathMappings
+     trainer.train()
+     #
+     # # https://github.com/facebookresearch/hydra/issues/440

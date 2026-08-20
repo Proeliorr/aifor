@@ -558,6 +558,39 @@ Dates follow the Hydra run logs in `outputs/<date>/<time>/`.
   non-destructive `git apply --check --reverse` verification, since `git stash` refuses to
   move intent-to-add entries and therefore proves nothing.
 
+## 2026-08-12 — `docs/gpu_training_runbook.md`: local smoke test → R2 → Vast.ai → two models
+
+- **Why.** Everything built since 2026-07-27 — the 4-class conversion, the LAZ export, the
+  converter, the second backbone — was verified statically or on a single plot. Nothing has
+  run end to end. `docs/train_logs.md` predates all of it and shows five classes. Finding a
+  broken path on a rented A100 is an expensive way to find out.
+- The document goes: **Part A** local smoke test (2 epochs per backbone on a 3-plot subset),
+  **B** push the image, **C** upload to R2, **D** rent the instance, **E** two 150-epoch
+  runs, **F** download the results, **G** troubleshooting, **H** time and cost.
+- **Facts established while writing it**, several of which change what the reader should do:
+  - The local **GTX 1660 Ti is sm_75**, inside the image's arch list `6.0;7.0;7.5;8.0;8.6` —
+    so Part A is a genuine CUDA test. The **A100 is sm_80**, also supported; a **4090/L40S
+    (8.9) or H100 (9.0) would be unusable**, since the list carries no `+PTX` fallback.
+  - The **repo-root `Dockerfile` cannot be used** — a VSCode template on `python:3-slim`
+    with no CUDA and a Windows backslash in its `CMD`. `container_export/Dockerfile.train`
+    is the real one. `docker-compose.yml` *is* usable, but only locally: its
+    `./ForAINet:/workspace` bind mount has nothing to bind to on a rented host.
+  - **The checkpoint is 308 MB**, and `training.wandb.public: True` makes `trainer.py:192`
+    copy it into the wandb directory **every epoch**, where wandb's live policy uploads it —
+    ~46 GB per run over 150 epochs. `training.wandb.public=False` stops that without
+    disabling wandb (`Wandb.launch` simply fires from `trainer.py:141` instead of `:76`).
+    A finished run directory reports ~620 MB because `wandb/` holds a second copy.
+  - `dataset_factory.py:15` resolves `dataroot` with `hydra.utils.to_absolute_path`, i.e.
+    against the launch directory rather than Hydra's output directory — which is what makes
+    the container data path predictable.
+  - The `debugpy.breakpoint()` calls in `train.py` are already commented out, so unattended
+    training will not hang.
+- **Verified mechanically** (`scratchpad/check_runbook.py`): every file the reader is told
+  to use exists, all four Hydra config groups resolve, both `model_name` blocks resolve to
+  the right classes, the "`models=` is required" claim holds (the default really does point
+  at a missing file), the data manifest is 14 `.laz` + 14 `_offsets.yml`, and every
+  cross-document link resolves.
+
 ---
 
 ## Planned

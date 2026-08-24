@@ -15,6 +15,7 @@ it by re-running the copy rather than by editing these files, or the two will dr
 | `pipeline/__init__.py` | package marker |
 | `misc/Points2ForAINet.py` | the same CLI under its historic name |
 | `smoke_test.py` | build-time check (see below) |
+| `preflight.sh` | one-command cheap-GPU pre-flight gate — see [`docs/preflight_cheap_gpu.md`](../docs/preflight_cheap_gpu.md) |
 | `Dockerfile.train` | the thin layer |
 | `.dockerignore` | stops clouds / `outputs/` / `.pyc` entering the image later |
 

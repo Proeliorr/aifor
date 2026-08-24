@@ -591,6 +591,28 @@ Dates follow the Hydra run logs in `outputs/<date>/<time>/`.
   at a missing file), the data manifest is 14 `.laz` + 14 `_offsets.yml`, and every
   cross-document link resolves.
 
+## 2026-08-24 — Cheap-GPU pre-flight gate
+
+- **`container_export/preflight.sh` + `docs/preflight_cheap_gpu.md`**: a one-command
+  PASS/FAIL gate that validates the whole container chain on a **cheap, supported GPU**
+  (T4/3090, ~$0.10–0.40) before renting the A100. Motivated by the dev machine no longer
+  having a local NVIDIA GPU, so `gpu_training_runbook.md` Part A ("test locally first")
+  can't run there — the cheapest equivalent is a short cheap-instance rental.
+- Env-var driven to match how the instance is provisioned: reads `DATASET_TRAIN_URL`
+  (dataset archive), `DATASET_PATCH` (patch + converter archive), `WANDB_API_KEY`
+  (optional step F). Auto-detects `.zip`/`.tar.gz`/`.tar`/`.7z` (sniffs content when the
+  URL carries no extension).
+- Covers exactly the two verification scopes chosen: **converter + smoke test**, and
+  **training startup for both backbones**. Steps: GPU-arch check against the image's
+  `6.0;7.0;7.5;8.0;8.6` kernel set (fails loudly on a 4090/L40S/H100 — no `+PTX`
+  fallback), `unset SPARSE_BACKEND`, fetch+apply the 4-class patch if absent, run
+  `smoke_test.py`, fetch+convert `.laz`→`.ply` via the `python3.8 -m pipeline.convert`
+  CLI (note: `--plots` is **space**-separated here, unlike the Hydra `convert.plots=[...]`),
+  clear `processed_0.2`, then 2-epoch runs of `PointGroup-PAPER` and `PointGroup-PAPER-TS`.
+- `PREFLIGHT_DRYRUN=1` prints every command without executing (verified on the GPU-less
+  dev box); `PREFLIGHT_PLOTS`, `PREFLIGHT_EPOCHS`, `PREFLIGHT_SKIP_TRAIN`, `PREFLIGHT_WANDB`
+  tune scope/cost. Registered in `container_export/README.md`.
+
 ---
 
 ## Planned

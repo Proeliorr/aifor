@@ -48,6 +48,9 @@ FORAINET = ROOT / "ForAINet" / "PointCloudSegmentation"
 SEG = FORAINET / "torch_points3d" / "datasets" / "segmentation" / "treeins_set1.py"
 PAN = FORAINET / "torch_points3d" / "datasets" / "panoptic" / "treeins_set1.py"
 MODEL_CFG = FORAINET / "conf" / "models" / "panoptic" / "FORpartseg_3heads.yaml"
+# The pooled "final" report across plots. It repeats final_eval's 1-based constants in its
+# own `if __name__` block, so it drifts independently -- hence checking it here too.
+STATS = FORAINET / "evaluation_stats_FOR.py"
 
 
 # --------------------------------------------------------------------------- reading
@@ -101,6 +104,78 @@ def _color_rows(path: Path) -> Optional[int]:
         return len(ast.literal_eval(body))
     except (ValueError, SyntaxError):
         return None
+
+
+def _loads_under_omegaconf_20(path: Path) -> Optional[str]:
+    """Would the TRAINING IMAGE be able to parse this yaml? Returns None if yes.
+
+    The image has hydra-core 1.0.7, which pins omegaconf 2.0.x, whose yaml loader calls
+    ``construct_object()`` on every key node. A merge key (``<<: *anchor``) is a key node
+    tagged ``tag:yaml.org,2002:merge``, for which 2.0 registers no constructor -- so the
+    file raises while *parsing*, before hydra reads a single setting, and both backbones
+    die with an error that names neither.
+
+    omegaconf 2.3 (this repo's ``aifor`` env) overrides ``construct_mapping`` instead and
+    lets PyYAML expand merges, so a merge key looks perfectly fine on the dev machine.
+    That asymmetry already cost one rented-GPU run; this reproduces 2.0's loader exactly.
+    """
+    def no_duplicates_constructor(loader, node, deep=False):
+        mapping = {}
+        for key_node, value_node in node.value:
+            key = loader.construct_object(key_node, deep=deep)
+            value = loader.construct_object(value_node, deep=deep)
+            if key in mapping:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping", node.start_mark,
+                    "found duplicate key %s" % key, key_node.start_mark)
+            mapping[key] = value
+        return loader.construct_mapping(node, deep)
+
+    class Loader20(yaml.SafeLoader):
+        pass
+
+    Loader20.add_constructor(
+        yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, no_duplicates_constructor)
+    try:
+        yaml.load(path.read_text(encoding="utf-8"), Loader=Loader20)
+    except yaml.YAMLError as exc:
+        return str(exc).replace("\n", " ")
+    return None
+
+
+def _model_block_diff(path: Path, base: str, variant: str,
+                      allowed: Tuple[str, ...]) -> List[str]:
+    """Keys where ``variant`` differs from ``base`` beyond the ``allowed`` overrides.
+
+    The two blocks are a deliberate copy-paste (see the comment above PointGroup-PAPER-TS:
+    a merge key cannot be used here), so something has to notice when one is edited and
+    the other is not. Interpolations that name their own block -- every
+    ``${models.<name>.feat_size}`` -- are rewritten to the base's name before comparing,
+    since those are *supposed* to differ.
+    """
+    doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if base not in doc or variant not in doc:
+        return ["%s or %s is missing from %s" % (base, variant, path.name)]
+
+    def retarget(node):
+        if isinstance(node, dict):
+            return {k: retarget(v) for k, v in node.items()}
+        if isinstance(node, list):
+            return [retarget(v) for v in node]
+        if isinstance(node, str):
+            return node.replace("models.%s." % variant, "models.%s." % base)
+        return node
+
+    base_cfg, var_cfg = doc[base], retarget(doc[variant])
+    problems = []
+    for key in sorted(set(base_cfg) | set(var_cfg)):
+        if key in allowed:
+            continue
+        if base_cfg.get(key, "<absent>") != var_cfg.get(key, "<absent>"):
+            problems.append("%s: %s has %r, %s has %r"
+                            % (key, base, base_cfg.get(key, "<absent>"),
+                               variant, var_cfg.get(key, "<absent>")))
+    return problems
 
 
 def _yaml_value(path: Path, key: str) -> Tuple[bool, object]:
@@ -202,7 +277,49 @@ def main(argv: Optional[List[str]] = None) -> int:
     c.check("final_eval NUM_CLASSES (binary)", _literal(PAN, "NUM_CLASSES", inside="final_eval"),
             3, "unclassified / stuff / thing -- independent of the class count")
 
-    # --- the model config ----------------------------------------------------
+    # --- evaluation_stats_FOR.py: the pooled report across plots -------------
+    # Same 1-based scheme as final_eval, declared a second time in that script's
+    # `if __name__` block (which _literal sees, since it walks the whole module).
+    # Left at upstream's five-class values it silently averages mIoU/mAcc over a class
+    # that cannot exist and folds a phantom class 5 into "tree".
+    if STATS.exists():
+        hint = "evaluation_stats_FOR.py repeats final_eval's constants; keep them in step"
+        c.check("stats NUM_CLASSES_sem", _literal(STATS, "NUM_CLASSES_sem"), n_real + 1, hint)
+        c.check("stats sem_classcount", _literal(STATS, "sem_classcount"),
+                list(range(1, n_real + 1)), hint)
+        c.check("stats sem_classcount_remove_ground",
+                _literal(STATS, "sem_classcount_remove_ground"),
+                [c_ for c_ in range(1, n_real + 1) if names.get(c_) != "ground"],
+                "every real class except ground")
+        c.check("stats thing_classes", _literal(STATS, "thing_classes"), want_thing, hint)
+        c.check("stats stuff_classes", _literal(STATS, "stuff_classes"), want_stuff, hint)
+    else:
+        print("  [ok ] %-38s %r" % ("evaluation_stats_FOR.py absent", True))
+
+    # --- the model config: can the IMAGE even parse it? ----------------------
+    parse_error = _loads_under_omegaconf_20(MODEL_CFG)
+    if parse_error:
+        c.failures.append(
+            "%s does not parse under omegaconf 2.0 (what the image has):\n"
+            "      %s\n"
+            "      A YAML merge key (`<<: *anchor`) is the usual cause. It works here\n"
+            "      (omegaconf 2.3) and fails in the container, before model_name is read."
+            % (MODEL_CFG.name, parse_error))
+        print("  [FAIL] %-38s %s" % ("parses under omegaconf 2.0", parse_error))
+    elif args.verbose:
+        print("  [ok ] %-38s %r" % ("parses under omegaconf 2.0", True))
+
+    # PointGroup-PAPER-TS is a full copy of PointGroup-PAPER (it cannot use a merge key),
+    # so check the copy has not drifted. `class` picks the model file, `backend` the
+    # sparse library -- those two are the whole point of the variant.
+    drift = _model_block_diff(MODEL_CFG, "PointGroup-PAPER", "PointGroup-PAPER-TS",
+                              allowed=("class", "backend"))
+    for problem in drift:
+        c.failures.append("PointGroup-PAPER-TS drifted from PointGroup-PAPER\n      " + problem)
+        print("  [FAIL] %-38s %s" % ("TS block matches PAPER block", problem))
+    if not drift and args.verbose:
+        print("  [ok ] %-38s %r" % ("TS block matches PAPER block", True))
+
     present, pretrained = _yaml_value(MODEL_CFG, "path_pretrained")
     if present and pretrained:
         c.failures.append(

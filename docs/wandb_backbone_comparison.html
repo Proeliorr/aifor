@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<style>
+:root { --bg:#ffffff; --fg:#1f2328; --muted:#6a737d; --line:#e3e6ea;
+        --win:#16794a; --winbg:#e8f6ef; --lose:#b45309; --losebg:#fdf3e3; }
+body { background:var(--bg); color:var(--fg); margin:0; padding:20px;
+       font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+       font-size:14px; line-height:1.5; }
+h2 { margin:0 0 4px; font-size:20px; }
+h3 { margin:28px 0 2px; font-size:16px; }
+p.sub { margin:0 0 14px; color:var(--muted); font-size:13px; }
+table { border-collapse:collapse; width:100%; max-width:820px; margin:10px 0 18px; }
+caption { caption-side:top; text-align:left; font-weight:600; padding:10px 0 6px; font-size:13px;
+          letter-spacing:.02em; text-transform:uppercase; color:var(--muted); }
+th,td { border-bottom:1px solid var(--line); padding:7px 10px; text-align:right; }
+th:first-child, td:first-child { text-align:left; }
+thead th { background:#f5f7f9; border-bottom:2px solid var(--line); font-weight:600; white-space:nowrap; }
+tbody tr:hover { background:#fafbfc; }
+td.win  { background:var(--winbg);  color:var(--win);  font-weight:700; border-radius:3px; }
+td.lose { background:var(--losebg); color:var(--lose); font-weight:700; border-radius:3px; }
+td.num { font-variant-numeric:tabular-nums; }
+td.d-pos { color:var(--win); } td.d-neg { color:var(--lose); }
+.badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:12px;
+         font-weight:600; background:#eef2f6; color:#33415c; margin-right:6px; }
+.note { max-width:820px; border-left:3px solid #c8cdd3; background:#f7f9fa; padding:10px 14px;
+        margin:16px 0; color:#444; font-size:13px; }
+</style></head>
+<body>
+<h2>MinkowskiEngine vs TorchSparse 1.4</h2>
+<p class="sub">Same ForAINet / PointGroup model, same training data, same 4-class scheme (low_vegetation, ground, stem_points, live_branches); the <strong>only</strong> difference is the sparse-convolution backbone. Every figure is a <em>pooled</em> score — the confusion matrix and the instance matches are accumulated across plots and the metric computed once, which is not the same as averaging the per-plot reports.</p>
+<p><span class="badge">green = MinkowskiEngine ahead</span><span class="badge">orange = TorchSparse ahead</span>Higher is better for every metric shown.</p>
+<h3>Group A — held-out test plots (17 Sep)</h3>
+<p class="sub">plot_01_test + plot_14_test, pooled. Neither plot was seen in training or validation, so this is the comparison to quote. <strong>MinkowskiEngine leads on 25 of the 27 metrics, TorchSparse on 1, 1 tied.</strong></p>
+<table><caption>Semantic segmentation (4 classes)</caption><thead><tr><th>Metric</th><th>MinkowskiEngine</th><th>TorchSparse 1.4</th><th>&Delta; (Mink &minus; TS)</th></tr></thead><tbody>
+<tr><td>Overall accuracy</td><td class="num win">0.9048</td><td class="num">0.8996</td><td class="num d-pos">+0.0052</td></tr>
+<tr><td>Mean accuracy</td><td class="num win">0.8594</td><td class="num">0.8544</td><td class="num d-pos">+0.0051</td></tr>
+<tr><td><strong>mIoU</strong></td><td class="num win">0.7768</td><td class="num">0.7662</td><td class="num d-pos">+0.0107</td></tr>
+<tr><td>Overall accuracy, ground excluded</td><td class="num win">0.9101</td><td class="num">0.9040</td><td class="num d-pos">+0.0061</td></tr>
+<tr><td>Mean accuracy, ground excluded</td><td class="num win">0.8494</td><td class="num">0.8439</td><td class="num d-pos">+0.0055</td></tr>
+<tr><td><strong>mIoU, ground excluded</strong></td><td class="num win">0.7734</td><td class="num">0.7602</td><td class="num d-pos">+0.0132</td></tr>
+</tbody></table>
+<table><caption>Per-class IoU</caption><thead><tr><th>Metric</th><th>MinkowskiEngine</th><th>TorchSparse 1.4</th><th>&Delta; (Mink &minus; TS)</th></tr></thead><tbody>
+<tr><td>1 low_vegetation</td><td class="num win">0.7171</td><td class="num">0.6913</td><td class="num d-pos">+0.0258</td></tr>
+<tr><td>2 ground</td><td class="num win">0.7872</td><td class="num">0.7839</td><td class="num d-pos">+0.0033</td></tr>
+<tr><td>3 stem_points <em>(thing)</em></td><td class="num win">0.6952</td><td class="num">0.6849</td><td class="num d-pos">+0.0102</td></tr>
+<tr><td>4 live_branches <em>(thing)</em></td><td class="num win">0.9079</td><td class="num">0.9044</td><td class="num d-pos">+0.0035</td></tr>
+</tbody></table>
+<table><caption>Binary segmentation (tree / not-tree)</caption><thead><tr><th>Metric</th><th>MinkowskiEngine</th><th>TorchSparse 1.4</th><th>&Delta; (Mink &minus; TS)</th></tr></thead><tbody>
+<tr><td>Overall accuracy</td><td class="num win">0.9837</td><td class="num">0.9785</td><td class="num d-pos">+0.0051</td></tr>
+<tr><td>Mean accuracy</td><td class="num win">0.9807</td><td class="num">0.9770</td><td class="num d-pos">+0.0038</td></tr>
+<tr><td>IoU, not-tree</td><td class="num win">0.9430</td><td class="num">0.9263</td><td class="num d-pos">+0.0167</td></tr>
+<tr><td>IoU, tree</td><td class="num win">0.9776</td><td class="num">0.9706</td><td class="num d-pos">+0.0070</td></tr>
+<tr><td><strong>mIoU</strong></td><td class="num win">0.9603</td><td class="num">0.9484</td><td class="num d-pos">+0.0119</td></tr>
+</tbody></table>
+<table><caption>Instance segmentation (individual trees)</caption><thead><tr><th>Metric</th><th>MinkowskiEngine</th><th>TorchSparse 1.4</th><th>&Delta; (Mink &minus; TS)</th></tr></thead><tbody>
+<tr><td>MUCov</td><td class="num win">0.3572</td><td class="num">0.2976</td><td class="num d-pos">+0.0596</td></tr>
+<tr><td>MWCov</td><td class="num win">0.4194</td><td class="num">0.3694</td><td class="num d-pos">+0.0500</td></tr>
+<tr><td>Precision</td><td class="num win">0.5055</td><td class="num">0.4935</td><td class="num d-pos">+0.0120</td></tr>
+<tr><td>Recall</td><td class="num win">0.2383</td><td class="num">0.1959</td><td class="num d-pos">+0.0425</td></tr>
+<tr><td><strong>F1</strong></td><td class="num win">0.3239</td><td class="num">0.2804</td><td class="num d-pos">+0.0435</td></tr>
+</tbody></table>
+<table><caption>Panoptic quality</caption><thead><tr><th>Metric</th><th>MinkowskiEngine</th><th>TorchSparse 1.4</th><th>&Delta; (Mink &minus; TS)</th></tr></thead><tbody>
+<tr><td>RQ (things)</td><td class="num win">0.3239</td><td class="num">0.2804</td><td class="num d-pos">+0.0435</td></tr>
+<tr><td>SQ (things)</td><td class="num">0.7321</td><td class="num win">0.7553</td><td class="num d-neg">-0.0231</td></tr>
+<tr><td><strong>PQ (things)</strong></td><td class="num win">0.2372</td><td class="num">0.2118</td><td class="num d-pos">+0.0254</td></tr>
+<tr><td>RQ (stuff)</td><td class="num">1.0000</td><td class="num">1.0000</td><td class="num">0</td></tr>
+<tr><td>SQ (stuff)</td><td class="num win">0.9430</td><td class="num">0.9263</td><td class="num d-pos">+0.0167</td></tr>
+<tr><td>PQ (stuff)</td><td class="num win">0.9430</td><td class="num">0.9263</td><td class="num d-pos">+0.0167</td></tr>
+<tr><td>mean PQ (all)</td><td class="num win">0.5901</td><td class="num">0.5690</td><td class="num d-pos">+0.0210</td></tr>
+</tbody></table>
+<h3>Group B — all three evaluation plots (18 Sep)</h3>
+<p class="sub">plot_01_test + plot_14_test + plot_11_val, pooled. plot_11 was training's validation plot, so these numbers are not a clean held-out measure — they are here for completeness. <strong>MinkowskiEngine leads on 24 of the 27 metrics, TorchSparse on 2, 1 tied.</strong></p>
+<table><caption>Semantic segmentation (4 classes)</caption><thead><tr><th>Metric</th><th>MinkowskiEngine</th><th>TorchSparse 1.4</th><th>&Delta; (Mink &minus; TS)</th></tr></thead><tbody>
+<tr><td>Overall accuracy</td><td class="num win">0.8868</td><td class="num">0.8832</td><td class="num d-pos">+0.0037</td></tr>
+<tr><td>Mean accuracy</td><td class="num win">0.8342</td><td class="num">0.8302</td><td class="num d-pos">+0.0040</td></tr>
+<tr><td><strong>mIoU</strong></td><td class="num win">0.7278</td><td class="num">0.7215</td><td class="num d-pos">+0.0063</td></tr>
+<tr><td>Overall accuracy, ground excluded</td><td class="num win">0.8891</td><td class="num">0.8844</td><td class="num d-pos">+0.0047</td></tr>
+<tr><td>Mean accuracy, ground excluded</td><td class="num win">0.8513</td><td class="num">0.8453</td><td class="num d-pos">+0.0060</td></tr>
+<tr><td><strong>mIoU, ground excluded</strong></td><td class="num win">0.7365</td><td class="num">0.7268</td><td class="num d-pos">+0.0097</td></tr>
+</tbody></table>
+<table><caption>Per-class IoU</caption><thead><tr><th>Metric</th><th>MinkowskiEngine</th><th>TorchSparse 1.4</th><th>&Delta; (Mink &minus; TS)</th></tr></thead><tbody>
+<tr><td>1 low_vegetation</td><td class="num win">0.5926</td><td class="num">0.5779</td><td class="num d-pos">+0.0147</td></tr>
+<tr><td>2 ground</td><td class="num">0.7018</td><td class="num win">0.7057</td><td class="num d-neg">-0.0039</td></tr>
+<tr><td>3 stem_points <em>(thing)</em></td><td class="num win">0.6974</td><td class="num">0.6869</td><td class="num d-pos">+0.0105</td></tr>
+<tr><td>4 live_branches <em>(thing)</em></td><td class="num win">0.9194</td><td class="num">0.9155</td><td class="num d-pos">+0.0039</td></tr>
+</tbody></table>
+<table><caption>Binary segmentation (tree / not-tree)</caption><thead><tr><th>Metric</th><th>MinkowskiEngine</th><th>TorchSparse 1.4</th><th>&Delta; (Mink &minus; TS)</th></tr></thead><tbody>
+<tr><td>Overall accuracy</td><td class="num win">0.9732</td><td class="num">0.9694</td><td class="num d-pos">+0.0039</td></tr>
+<tr><td>Mean accuracy</td><td class="num win">0.9820</td><td class="num">0.9784</td><td class="num d-pos">+0.0037</td></tr>
+<tr><td>IoU, not-tree</td><td class="num win">0.9058</td><td class="num">0.8934</td><td class="num d-pos">+0.0125</td></tr>
+<tr><td>IoU, tree</td><td class="num win">0.9789</td><td class="num">0.9736</td><td class="num d-pos">+0.0053</td></tr>
+<tr><td><strong>mIoU</strong></td><td class="num win">0.9424</td><td class="num">0.9335</td><td class="num d-pos">+0.0089</td></tr>
+</tbody></table>
+<table><caption>Instance segmentation (individual trees)</caption><thead><tr><th>Metric</th><th>MinkowskiEngine</th><th>TorchSparse 1.4</th><th>&Delta; (Mink &minus; TS)</th></tr></thead><tbody>
+<tr><td>MUCov</td><td class="num win">0.3535</td><td class="num">0.3144</td><td class="num d-pos">+0.0390</td></tr>
+<tr><td>MWCov</td><td class="num win">0.4041</td><td class="num">0.3702</td><td class="num d-pos">+0.0339</td></tr>
+<tr><td>Precision</td><td class="num win">0.4771</td><td class="num">0.4737</td><td class="num d-pos">+0.0034</td></tr>
+<tr><td>Recall</td><td class="num win">0.2332</td><td class="num">0.2009</td><td class="num d-pos">+0.0323</td></tr>
+<tr><td><strong>F1</strong></td><td class="num win">0.3133</td><td class="num">0.2821</td><td class="num d-pos">+0.0311</td></tr>
+</tbody></table>
+<table><caption>Panoptic quality</caption><thead><tr><th>Metric</th><th>MinkowskiEngine</th><th>TorchSparse 1.4</th><th>&Delta; (Mink &minus; TS)</th></tr></thead><tbody>
+<tr><td>RQ (things)</td><td class="num win">0.3133</td><td class="num">0.2821</td><td class="num d-pos">+0.0311</td></tr>
+<tr><td>SQ (things)</td><td class="num">0.7180</td><td class="num win">0.7259</td><td class="num d-neg">-0.0079</td></tr>
+<tr><td><strong>PQ (things)</strong></td><td class="num win">0.2249</td><td class="num">0.2048</td><td class="num d-pos">+0.0201</td></tr>
+<tr><td>RQ (stuff)</td><td class="num">1.0000</td><td class="num">1.0000</td><td class="num">0</td></tr>
+<tr><td>SQ (stuff)</td><td class="num win">0.9058</td><td class="num">0.8934</td><td class="num d-pos">+0.0125</td></tr>
+<tr><td>PQ (stuff)</td><td class="num win">0.9058</td><td class="num">0.8934</td><td class="num d-pos">+0.0125</td></tr>
+<tr><td>mean PQ (all)</td><td class="num win">0.5654</td><td class="num">0.5491</td><td class="num d-pos">+0.0163</td></tr>
+</tbody></table>
+<h3>Reading the numbers</h3>
+<div class="note"><ul><li><strong>Semantic segmentation is close.</strong> Roughly one point of mIoU separates the backbones on the held-out plots — both learned essentially the same point classifier.</li><li><strong>Instance segmentation is where they part.</strong> MinkowskiEngine recovers noticeably more trees (recall, F1, coverage), which drives the PQ (things) gap.</li><li><strong>The only instance metric TorchSparse wins is SQ (things)</strong> — segmentation <em>quality</em> of the instances it did find. It matches fewer trees, but the ones it matches overlap the ground truth slightly better. RQ &times; SQ = PQ, and the RQ gap dominates. (In Group B it also edges out <code>ground</code> IoU.)</li><li><strong>RQ (stuff) is 1.0 for both</strong> by construction: one stuff region per plot, found by both, so the stuff column really only reports its IoU.</li><li><strong>These differences are not evaluation noise.</strong> Re-running the same checkpoint through the same evaluation path reproduced the numbers exactly. They are, however, one <em>training</em> run per backbone, so what is compared is these two trained models — not the two libraries in general.</li></ul></div>
+</body></html>

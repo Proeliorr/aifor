@@ -1,17 +1,76 @@
+diff --git a/PointCloudSegmentation/conf/eval.yaml b/PointCloudSegmentation/conf/eval.yaml
+index f988642..3a4d013 100644
+--- a/PointCloudSegmentation/conf/eval.yaml
++++ b/PointCloudSegmentation/conf/eval.yaml
+@@ -4,18 +4,49 @@ defaults:
+ num_workers: 0
+ batch_size: 1
+ cuda: 0
++# LOCAL PATCH (SegmentedForests): each .pt stores 22 weight sets -- `latest` (the final
++# epoch, 99) plus 21 `best_<metric>` snapshots (miou, macc, F1, map, ...), each saved at the
++# epoch where that metric peaked on the VALIDATION plot, plot_11_val. A `best_*` snapshot is
++# therefore optimistic when evaluated on plot_11 itself.
++# Two traps:
++#   * an unknown name does NOT fail. model_checkpoint.py:136-145 catches the KeyError with a
++#     bare `except:` and silently loads `latest`. Read the log line
++#     "Model loaded from ...:<key>" to see what you actually got.
++#   * never `miou` with PointGroup-PAPER-TS: its best_miou is epoch 22, BEFORE
++#     `prepare_epoch: 30`, so that snapshot's ScoreNet was never trained.
+ weight_name: "latest" # Used during resume, select with model to load from [miou, macc, acc..., latest]
+ enable_cudnn: True
+-checkpoint_dir: # "{your_output_log_path}/outputs/2020-01-28/11-04-13"
++# LOCAL PATCH (SegmentedForests): a CONTAINER path. docker-compose.yml mounts ./ForAINet at
++# /workspace, and both trained checkpoints sit in ForAINet/pre-trained_models/.
++# Checkpoint.load resolves `<checkpoint_dir>/<model_name>.pt`, so one directory serves both
++# models and `model_name=` picks between them. The folder is untracked in the submodule on
++# purpose: never `git add -N` it, and the 1.5 GB cannot reach patches/forainet-local.patch.
++checkpoint_dir: /workspace/pre-trained_models
+ #checkpoint_dir: "/cluster/work/igp_psr/binbin/OutdoorPanopticSeg_V2/outputs/ablation_area4_head3_5_radius16_cylinder/ablation_area4_head3_5_radius16_cylinder-PointGroup-PAPER-20221027_093610" for example
++# PointGroup-PAPER    = MinkowskiEngine backbone (default)
++# PointGroup-PAPER-TS = TorchSparse 1.4 backbone:   python eval.py model_name=PointGroup-PAPER-TS
+ model_name: PointGroup-PAPER
+ precompute_multi_scale: True # Compute multiscate features on cpu for faster training / inference
+ enable_dropout: False
+ voting_runs: 1
+ data: 
+   # number, e.g. 3 OR ply path, e.g. "/cluster/work/igp_psr/yuayue/RA/WP1/check_jan12/TP3D_PanopticSeg/data/npm3dfused/raw/Paris.ply"
+-  # test files for basic settings (remember change to your data path)
+-  fold: ['/cluster/work/igp_psr/binbin/OutdoorPanopticSeg_V2/data_set1_5classes/treeinsfused/raw/CULS/CULS_plot_2_annotated_test.ply', '/cluster/work/igp_psr/binbin/OutdoorPanopticSeg_V2/data_set1_5classes/treeinsfused/raw/NIBIO/NIBIO_plot_1_annotated_test.ply', '/cluster/work/igp_psr/binbin/OutdoorPanopticSeg_V2/data_set1_5classes/treeinsfused/raw/NIBIO/NIBIO_plot_17_annotated_test.ply', '/cluster/work/igp_psr/binbin/OutdoorPanopticSeg_V2/data_set1_5classes/treeinsfused/raw/NIBIO/NIBIO_plot_18_annotated_test.ply', '/cluster/work/igp_psr/binbin/OutdoorPanopticSeg_V2/data_set1_5classes/treeinsfused/raw/NIBIO/NIBIO_plot_22_annotated_test.ply', '/cluster/work/igp_psr/binbin/OutdoorPanopticSeg_V2/data_set1_5classes/treeinsfused/raw/NIBIO/NIBIO_plot_23_annotated_test.ply', '/cluster/work/igp_psr/binbin/OutdoorPanopticSeg_V2/data_set1_5classes/treeinsfused/raw/NIBIO/NIBIO_plot_5_annotated_test.ply', '/cluster/work/igp_psr/binbin/OutdoorPanopticSeg_V2/data_set1_5classes/treeinsfused/raw/RMIT/RMIT_test_test.ply', '/cluster/work/igp_psr/binbin/OutdoorPanopticSeg_V2/data_set1_5classes/treeinsfused/raw/SCION/SCION_plot_31_annotated_test.ply', '/cluster/work/igp_psr/binbin/OutdoorPanopticSeg_V2/data_set1_5classes/treeinsfused/raw/SCION/SCION_plot_61_annotated_test.ply', '/cluster/work/igp_psr/binbin/OutdoorPanopticSeg_V2/data_set1_5classes/treeinsfused/raw/TUWIEN/TUWIEN_test_test.ply']
++  # LOCAL PATCH (SegmentedForests): absolute CONTAINER paths to labelled PLYs, converted from
++  # the Stage 2 LAZ export with `python convert.py` -- a pure format change, so coordinates
++  # stay centred exactly as the model trained on them.
++  #
++  # eval.py IGNORES the _val / _test suffix. With paths here, every split goes through
++  # process_test() and evaluates exactly these files; the suffix only matters to train.py.
++  #
++  # Output files are numbered by POSITION in this list:
++  #   Evaluation_0.txt = plot_01_test   Evaluation_1.txt = plot_14_test   Evaluation_2.txt = plot_11_val
++  # plot_11_val is the plot training validated on (and picked the best_* weights with); the two
++  # _test plots never influenced any weights, so they are the numbers to report.
++  fold: ['/workspace/PointCloudSegmentation/data_set1_5classes/treeinsfused/raw/SegmentedForests/plot_01_test.ply',
++         '/workspace/PointCloudSegmentation/data_set1_5classes/treeinsfused/raw/SegmentedForests/plot_14_test.ply',
++         '/workspace/PointCloudSegmentation/data_set1_5classes/treeinsfused/raw/SegmentedForests/plot_11_val.ply']
++  # Upstream shipped eleven FOR-instance test files from the author's cluster here
++  # (/cluster/work/igp_psr/binbin/.../CULS_plot_2_annotated_test.ply and ten more).
+   # test files for understory trees experiment
+   #fold: ['/cluster/work/igp_psr/binbin/OutdoorPanopticSeg_V2/data_set1_5classes/treeinsfused/raw/NIBIO2/NIBIO2_plot1_annotated_test.ply', '/cluster/work/igp_psr/binbin/OutdoorPanopticSeg_V2/data_set1_5classes/treeinsfused/raw/NIBIO2/NIBIO2_plot10_annotated_test.ply', '/cluster/work/igp_psr/binbin/OutdoorPanopticSeg_V2/data_set1_5classes/treeinsfused/raw/NIBIO2/NIBIO2_plot15_annotated_test.ply', '/cluster/work/igp_psr/binbin/OutdoorPanopticSeg_V2/data_set1_5classes/treeinsfused/raw/NIBIO2/NIBIO2_plot27_annotated_test.ply', '/cluster/work/igp_psr/binbin/OutdoorPanopticSeg_V2/data_set1_5classes/treeinsfused/raw/NIBIO2/NIBIO2_plot3_annotated_test.ply', '/cluster/work/igp_psr/binbin/OutdoorPanopticSeg_V2/data_set1_5classes/treeinsfused/raw/NIBIO2/NIBIO2_plot32_annotated_test.ply', '/cluster/work/igp_psr/binbin/OutdoorPanopticSeg_V2/data_set1_5classes/treeinsfused/raw/NIBIO2/NIBIO2_plot34_annotated_test.ply', '/cluster/work/igp_psr/binbin/OutdoorPanopticSeg_V2/data_set1_5classes/treeinsfused/raw/NIBIO2/NIBIO2_plot35_annotated_test.ply', '/cluster/work/igp_psr/binbin/OutdoorPanopticSeg_V2/data_set1_5classes/treeinsfused/raw/NIBIO2/NIBIO2_plot48_annotated_test.ply', '/cluster/work/igp_psr/binbin/OutdoorPanopticSeg_V2/data_set1_5classes/treeinsfused/raw/NIBIO2/NIBIO2_plot49_annotated_test.ply', '/cluster/work/igp_psr/binbin/OutdoorPanopticSeg_V2/data_set1_5classes/treeinsfused/raw/NIBIO2/NIBIO2_plot52_annotated_test.ply', '/cluster/work/igp_psr/binbin/OutdoorPanopticSeg_V2/data_set1_5classes/treeinsfused/raw/NIBIO2/NIBIO2_plot53_annotated_test.ply', '/cluster/work/igp_psr/binbin/OutdoorPanopticSeg_V2/data_set1_5classes/treeinsfused/raw/NIBIO2/NIBIO2_plot58_annotated_test.ply', '/cluster/work/igp_psr/binbin/OutdoorPanopticSeg_V2/data_set1_5classes/treeinsfused/raw/NIBIO2/NIBIO2_plot6_annotated_test.ply', '/cluster/work/igp_psr/binbin/OutdoorPanopticSeg_V2/data_set1_5classes/treeinsfused/raw/NIBIO2/NIBIO2_plot60_annotated_test.ply']
+ tracker_options: # Extra options for the tracker
+@@ -25,6 +56,9 @@ tracker_options: # Extra options for the tracker
+ 
+ hydra:
+   run:
+-    dir: ${checkpoint_dir}/eval/${now:%Y-%m-%d_%H-%M-%S}
++    # LOCAL PATCH (SegmentedForests): ${model_name} added so the two backbones' reports land in
++    # separate folders. Evaluation_*.txt is opened in APPEND mode -- a shared folder would stack
++    # MinkowskiEngine and TorchSparse reports into the same file.
++    dir: ${checkpoint_dir}/eval/${model_name}/${now:%Y-%m-%d_%H-%M-%S}
+ 
+ 
 diff --git a/PointCloudSegmentation/conf/models/panoptic/FORpartseg_3heads.yaml b/PointCloudSegmentation/conf/models/panoptic/FORpartseg_3heads.yaml
-index fa9002b..4fe6313 100644
+index fa9002b..7f9b6d9 100644
 --- a/PointCloudSegmentation/conf/models/panoptic/FORpartseg_3heads.yaml
 +++ b/PointCloudSegmentation/conf/models/panoptic/FORpartseg_3heads.yaml
-@@ -60,7 +60,7 @@ PointGroup:
- 
-   vizual_ratio: 0
- 
--PointGroup-PAPER:
-+PointGroup-PAPER: &paper
-   class: PointGroup3heads.PointGroup3heads
-   conv_type: "SPARSE"
-   scorer_type: "unet"
-@@ -174,4 +174,39 @@ PointGroup-PAPER:
+@@ -174,4 +174,162 @@ PointGroup-PAPER:
    cluster_type: 7
    vizual_ratio: 0
  
@@ -36,9 +95,18 @@ index fa9002b..4fe6313 100644
 +#
 +#   python train.py ... model_name=PointGroup-PAPER-TS
 +#
-+# `<<: *paper` is a YAML merge key: every setting is inherited from PointGroup-PAPER and
-+# only the two lines below differ, so the backbone shape, scorer_type, prepare_epoch and
-+# the rest cannot drift between the two blocks.
++# WHY THIS BLOCK IS A FULL COPY and not `<<: *paper`, which is what it used to be:
++# a YAML merge key CANNOT be loaded by the omegaconf that hydra-core 1.0.7 pins (2.0.x),
++# which is what the training image has. 2.0's loader calls construct_object() on every
++# key node, so `<<` reaches an unregistered tag:yaml.org,2002:merge and raises
++# `could not determine a constructor for the tag` -- while *parsing the file*, before
++# model_name is ever read, so BOTH backbones die and the error names neither. omegaconf
++# 2.3 (the `aifor` env on the dev machine) expands merge keys happily, which is exactly
++# why this shipped: it was only ever validated off-image. Do not reintroduce the anchor.
++#
++# The duplication is guarded: misc/check_forainet_classes.py asserts this block equals
++# PointGroup-PAPER except for `class` and `backend`, and that the file still parses under
++# 2.0 semantics. Run it after editing either block.
 +#
 +# `class:` is the real backbone switch -- it selects the Python file, and that file's
 +# import decides the sparse-conv library. (The `class: minkowski.Minkowski_Model` keys in
@@ -49,9 +117,123 @@ index fa9002b..4fe6313 100644
 +# Gotcha: SPARSE_BACKEND in the environment silently overrides `backend` below
 +# (applications/sparseconv3d.py:59-62). Unset it, or this block will not run TorchSparse.
 +PointGroup-PAPER-TS:
-+  <<: *paper
 +  class: PointGroup3heads_ts.PointGroup3heads
 +  backend: "torchsparse"
++  conv_type: "SPARSE"
++  scorer_type: "unet"
++  weight_name: "latest"
++
++  use_score_net: True
++  mask_supervise: False
++  use_mask_filter_score_feature: False
++  use_mask_filter_score_feature_start_epoch: 50
++  mask_filter_score_feature_thre: 0.5
++
++  cal_iou_based_on_mask: False
++  cal_iou_based_on_mask_start_epoch: 50
++
++  loss_weights:
++    semantic: 1
++    offset_norm_loss: 0.1
++    offset_dir_loss: 0.1
++    score_loss: 1
++    mask_loss: 1
++    embedding_loss: 1
++
++  bandwidth: 0.6
++  embed_dim: 5
++  feat_size: 16
++  backbone:
++    architecture: "unet"
++    config:
++      class: minkowski.Minkowski_Model
++      conv_type: "SPARSE"
++      define_constants:
++        in_feat: ${models.PointGroup-PAPER-TS.feat_size}
++      down_conv:
++        module_name: ResNetDown
++        dimension: 3
++        down_conv_nn:
++          [
++            [ FEAT, in_feat ],
++            [ in_feat, 2*in_feat ],
++            [ 2*in_feat, 3*in_feat ],
++            [ 3*in_feat, 4*in_feat ],
++            [ 4*in_feat, 5*in_feat ],
++            [ 5*in_feat, 6*in_feat ],
++            [ 6*in_feat, 7*in_feat ],
++          ]
++        kernel_size: 3
++        stride: [ 1, 2, 2, 2, 2, 2, 2 ]
++        N: 2
++      up_conv:
++        module_name: ResNetUp
++        dimension: 3
++        up_conv_nn:
++          [
++            [ 7*in_feat, 6*in_feat ],
++            [ 2*6*in_feat, 5*in_feat ],
++            [ 2*5*in_feat, 4*in_feat ],
++            [ 2*4*in_feat, 3*in_feat ],
++            [ 2*3*in_feat, 2*in_feat ],
++            [ 2*2*in_feat, in_feat ],
++            [ 2*in_feat, in_feat ],
++          ]
++        kernel_size: 3
++        stride: [ 2, 2, 2, 2, 2, 2, 1 ]
++        N: 2
++
++  scorer_unet:
++    class: minkowski.Minkowski_Model
++    conv_type: "SPARSE"
++    define_constants:
++      in_feat: ${models.PointGroup-PAPER-TS.feat_size}
++    down_conv:
++      module_name: ResNetDown
++      dimension: 3
++      down_conv_nn: [ [ in_feat, 2*in_feat ], [ 2*in_feat, 4*in_feat ] ]
++      kernel_size: 3
++      stride: 2
++      N: 2
++    up_conv:
++      module_name: ResNetUp
++      dimension: 3
++      up_conv_nn: [ [ 4*in_feat, 2*in_feat ], [ 4*in_feat, in_feat ] ]
++      kernel_size: 3
++      stride: 2
++      N: 2
++  scorer_encoder:
++    class: minkowski.Minkowski_Model
++    conv_type: "SPARSE"
++    define_constants:
++      in_feat: ${models.PointGroup-PAPER-TS.feat_size}
++    down_conv:
++      module_name: ResNetDown
++      dimension: 3
++      down_conv_nn: [ [ in_feat, 2*in_feat ], [ 2*in_feat, 4*in_feat ] ]
++      kernel_size: 3
++      stride: 2
++      N: 2
++    innermost:
++      module_name: GlobalBaseModule
++      activation:
++        name: LeakyReLU
++        negative_slope: 0.2
++      aggr: "max"
++      nn: [ 4*in_feat, in_feat ]
++
++  prepare_epoch: 30
++  cluster_radius_search: 1.5 * ${data.grid_size}
++
++  min_iou_threshold: 0.25
++  max_iou_threshold: 0.75
++
++  cluster_type: 7
++  vizual_ratio: 0
++
++  # null for the same reason as in PointGroup-PAPER above: the upstream checkpoint is
++  # 5-class and would be loaded with strict=False, silently dropping our 4-wide head.
++  path_pretrained: null
 diff --git a/PointCloudSegmentation/conf/training/default.yaml b/PointCloudSegmentation/conf/training/default.yaml
 index e07724b..7af3899 100644
 --- a/PointCloudSegmentation/conf/training/default.yaml
@@ -109,8 +291,232 @@ index 54b0608..0788b3f 100644
    id:
    public: True # It will be display the model within wandb log, else not.
    config:
+diff --git a/PointCloudSegmentation/evaluation_stats_FOR.py b/PointCloudSegmentation/evaluation_stats_FOR.py
+index 3c1517e..b5d0a80 100644
+--- a/PointCloudSegmentation/evaluation_stats_FOR.py
++++ b/PointCloudSegmentation/evaluation_stats_FOR.py
+@@ -1,31 +1,76 @@
+ from pathlib import Path
++import datetime
+ import glob
++import sys
+ from collections import defaultdict
+ from plyfile import PlyData, PlyElement
+ import numpy as np
+ from scipy import stats
+-from torch_points3d.modules.KPConv.plyutils import read_ply
++# LOCAL PATCH (SegmentedForests): the `read_ply` import that used to be here was NEVER
++# CALLED -- every read below goes through plyfile, which handles ascii and binary alike.
++# It was the only thing pulling torch_points3d (and therefore torch, MinkowskiEngine and a
++# GPU-shaped environment) into this script, so dropping it lets the pooled report run on
++# the host:  cmd /c "mamba run -n aifor python evaluation_stats_FOR.py <run_dir> 0 1"
+ 
+ #This file produces stats about the total average F1 score, the average F1 score per forest region, and packs all F1 score within a forest region together
+ #and save these stats in a file called "Eval_F1_per_region"
+ if __name__ == '__main__':
+     #initialization
+     NUM_CLASSES = 3  # @Treeins: classes unclassified, non-tree and tree
+-    NUM_CLASSES_sem = 6
+-    NUM_CLASSES_count = 2  # @Treeins: 2 classes without unclassified
++    # LOCAL PATCH (SegmentedForests): 5 -> 4 semantic classes, everywhere below.
++    # These are the SAME constants, with the same 1-based meaning, that `final_eval` in
++    # datasets/panoptic/treeins_set1.py carries -- see docs/eval_process.md section 6 for
++    # the two numbering schemes. conf/config.yaml `classes:` is the source of truth, and
++    # `python misc/check_forainet_classes.py` re-derives every value here from it and fails
++    # loudly on a mismatch. Upstream's values are kept in the comments.
++    NUM_CLASSES_sem = 5              # was 6: four real classes plus index 0 = ignore
++    NUM_CLASSES_count = 4            # was 2; only read by commented-out code below
+     # class index for instance segmenatation
+     ins_classcount = [2]  # @Treeins
+     # class index for stuff segmentation
+     stuff_classcount = [1]  # @Treeins
+     # class index for semantic segmenatation
+-    sem_classcount = [1, 2, 3, 4, 5] # @Treeins
+-    sem_classcount_remove_ground = [1, 3, 4, 5]
++    sem_classcount = [1, 2, 3, 4]            # was [1, 2, 3, 4, 5]
++    sem_classcount_remove_ground = [1, 3, 4] # was [1, 3, 4, 5]; drops 2 = ground
+     sem_classcount_have = []
+-    stuff_classes = [1,2]
+-    thing_classes = [3,4,5]
++    stuff_classes = [1,2]                    # low_vegetation, ground (unchanged)
++    thing_classes = [3,4]                    # was [3, 4, 5]; stem_points, live_branches
+     # Initialize...
+-    # replace "test_sem_path" by your path
+-    test_sem_path = '/cluster/work/igp_psr/binbin/OutdoorPanopticSeg_V2/outputs/setting1_classes5_best10/setting1_classes5_best10-PointGroup-PAPER-20230905_115152/eval/2023-09-13_17-20-21'
++    # LOCAL PATCH (SegmentedForests): the run directory comes from the command line now.
++    #
++    #   python evaluation_stats_FOR.py <eval_run_dir> [index ...]
++    #
++    # With indices it pools only those plots, e.g. `... 0 1` for the two _test plots while
++    # leaving out the _val plot training selected on; with none it pools every plot it
++    # finds, as upstream did. The index is the file's position in eval.yaml's `data.fold`.
++    #
++    # The default below is only a fallback. It was also a trap: written as a plain string,
++    # Python read `\04` as a control character and `\assignment` as a BEL, so glob matched
++    # nothing, the loop never ran, and the script died later on an undefined variable.
++    # Hence the r"" prefix.
++    # TO ADAPT: your own eval run directory.
++    test_sem_path = r"D:\Podyplomowe\04_AI_Intro\assignment\ForAINet\pre-trained_models\eval\PointGroup-PAPER\2026-09-17_13-43-04"
++    if len(sys.argv) > 1:
++        test_sem_path = sys.argv[1]
++    only_indices = [int(a) for a in sys.argv[2:]]
++
++    # LOCAL PATCH (SegmentedForests): find and validate the input files BEFORE opening the
++    # report, so pointing this at the wrong directory leaves nothing behind. (The file
++    # lists themselves are built further down, next to upstream's TO ADAPT comments.)
++    _sem = sorted(glob.glob(test_sem_path + '/Semantic_results_forEval*.ply'),
++                  key=lambda name: int(Path(name).stem.rsplit('_', 1)[1]))
++    _ins = sorted(glob.glob(test_sem_path + '/Instance_Results_forEval*.ply'),
++                  key=lambda name: int(Path(name).stem.rsplit('_', 1)[1]))
++    if not _sem or len(_sem) != len(_ins):
++        sys.exit(f"found {len(_sem)} semantic and {len(_ins)} instance file(s) in "
++                 f"{test_sem_path}\nExpected matching Semantic_results_forEval_<i>.ply and "
++                 "Instance_Results_forEval_<i>.ply pairs from an eval.py run.")
++    _have = {int(Path(p).stem.rsplit('_', 1)[1]) for p in _sem}
++    _missing = [i for i in only_indices if i not in _have]
++    if _missing:
++        sys.exit(f"no Semantic_results_forEval file(s) for index/indices {_missing} in "
++                 f"{test_sem_path}; found {sorted(_have)}")
++
+     LOG_FOUT = open(test_sem_path+'/evaluation_total.txt', 'a')  # @Treeins: save evaluation file with name output_file_name
+ 
+     def log_string(out_str):
+@@ -48,6 +93,15 @@ if __name__ == '__main__':
+     # mucov and mwcov
+     all_mean_cov = [[] for itmp in range(NUM_CLASSES)]
+     all_mean_weighted_cov = [[] for itmp in range(NUM_CLASSES)]
++
++    # LOCAL PATCH (SegmentedForests): the binary (tree / non-tree) counters live HERE, not
++    # inside the per-plot loop. Upstream re-zeroed them on every plot, so every
++    # "Binary Semantic Segmentation" figure -- and the stuff-class RQ / SQ / PQ derived
++    # from iou_list_bi -- described only the LAST plot while claiming to be the pooled
++    # result. Everything else in this script already accumulated correctly.
++    true_positive_classes_bi = np.zeros(NUM_CLASSES)
++    positive_classes_bi = np.zeros(NUM_CLASSES)
++    gt_classes_bi = np.zeros(NUM_CLASSES)
+     
+     #TO ADAPT: test_sem_list is the list of semantic prediction files 
+     test_sem_list = sorted(glob.glob(test_sem_path + '/Semantic_results_forEval*.ply', recursive=False), key=lambda name:int(name[26+len(test_sem_path):-4]))
+@@ -56,6 +110,46 @@ if __name__ == '__main__':
+     test_ins_list = sorted(glob.glob(test_sem_path + '/Instance_Results_forEval*.ply', recursive=False), key=lambda name:int(name[26+len(test_sem_path):-4]))
+     #glob.glob(test_sem_path + '/Instance_Embed_results_forEval*.ply', recursive=False)
+ 
++    # LOCAL PATCH (SegmentedForests): honour the indices given on the command line, fail
++    # loudly on an empty selection, and record in the report WHICH plots were pooled.
++    #
++    # The empty case used to be silent: glob returned nothing, the per-plot loop below
++    # never ran, and the script crashed ~200 lines later on a variable that loop defines.
++    if only_indices:
++        def _pick(paths, label):
++            by_index = {int(Path(p).stem.rsplit('_', 1)[1]): p for p in paths}
++            missing = [i for i in only_indices if i not in by_index]
++            if missing:
++                sys.exit(f"no {label} file(s) for index/indices {missing} in {test_sem_path}")
++            return [by_index[i] for i in only_indices]
++        test_sem_list = _pick(test_sem_list, "Semantic_results_forEval")
++        test_ins_list = _pick(test_ins_list, "Instance_Results_forEval")
++    if not test_sem_list or len(test_sem_list) != len(test_ins_list):
++        sys.exit(f"found {len(test_sem_list)} semantic and {len(test_ins_list)} instance "
++                 f"file(s) in {test_sem_path}\n"
++                 "Expected matching Semantic_results_forEval_<i>.ply and "
++                 "Instance_Results_forEval_<i>.ply pairs from an eval.py run.")
++
++    # This report is opened in APPEND mode, so re-running stacks blocks in one file. Head
++    # each block with what it covers -- including the fold entry behind every index, read
++    # from the run's own .hydra/config.yaml -- so no block can be misread later.
++    log_string("=" * 78)
++    log_string(f"pooled report  {datetime.datetime.now():%Y-%m-%d %H:%M:%S}")
++    log_string(f"  run dir : {test_sem_path}")
++    log_string(f"  pooling : {len(test_sem_list)} plot(s)"
++               + (f", indices {only_indices}" if only_indices else " (all found)"))
++    try:
++        import yaml  # only needed for this note; never fail the report over it
++        fold = yaml.safe_load(
++            (Path(test_sem_path) / ".hydra" / "config.yaml").read_text(encoding="utf-8")
++        )["data"]["fold"]
++        for path in test_sem_list:
++            i = int(Path(path).stem.rsplit('_', 1)[1])
++            log_string(f"    [{i}] {Path(fold[i]).name if i < len(fold) else '?'}")
++    except Exception as exc:
++        log_string(f"    (could not read data.fold from .hydra/config.yaml: {exc})")
++    log_string("=" * 78)
++
+     #pred_sem_complete = np.array([])
+     #gt_sem_complete = np.array([])
+     #pred_ins_complete = np.array([])
+@@ -118,9 +212,7 @@ if __name__ == '__main__':
+         for i in thing_classes:
+             gt_sem_complete[gt_labels_copy==i] = 2
+         # pn semantic mIoU
+-        true_positive_classes_bi = np.zeros(NUM_CLASSES)
+-        positive_classes_bi = np.zeros(NUM_CLASSES)
+-        gt_classes_bi = np.zeros(NUM_CLASSES)
++        # (the three binary counters are initialised once, above the loop -- LOCAL PATCH)
+         for j in range(gt_sem_complete.shape[0]):
+             gt_l = int(gt_sem_complete[j])
+             pred_l = int(pred_sem_complete[j])
+@@ -250,10 +342,13 @@ if __name__ == '__main__':
+     for i in range(NUM_CLASSES_sem):
+         if gt_classes[i] > 0:
+             sem_classcount_have.append(i)
+-            iou = true_positive_classes[i]/float(gt_classes[i]+positive_classes[i]-true_positive_classes[i]) 
++            iou = true_positive_classes[i]/float(gt_classes[i]+positive_classes[i]-true_positive_classes[i])
+         else:
+             iou = 0.0
+-        iou_list.append(iou)
++        # LOCAL PATCH (SegmentedForests): float(), so the printed list reads
++        # [0.0, 0.717, ...] instead of numpy 2's [0.0, np.float64(0.717), ...]. This is a
++        # report meant to be read and quoted.
++        iou_list.append(float(iou))
+         
+     set1 = set(sem_classcount)
+     set2 = set(sem_classcount_have)
+@@ -274,7 +369,12 @@ if __name__ == '__main__':
+     set3 = set1 & set2
+     sem_classcount_final = list(set3)
+     
+-    log_string('Semantic Segmentation oAcc without ground points: {}'.format(sum(true_positive_classes[sem_classcount_final])/float(sum(positive_classes[[sem_classcount_final]]))))
++    # LOCAL PATCH (SegmentedForests): positive_classes[[sem_classcount_final]] -> single
++    # brackets. The doubled ones made the index a nested list, so numpy returned a (1, K)
++    # array, the builtin sum() collapsed only the first axis and float() was handed a
++    # K-element array: `TypeError: only 0-dimensional arrays can be converted to Python
++    # scalars`. With more than one class this line could never have run.
++    log_string('Semantic Segmentation oAcc without ground points: {}'.format(sum(true_positive_classes[sem_classcount_final])/float(sum(positive_classes[sem_classcount_final]))))
+     #log_string('Semantic Segmentation Acc: {}'.format(true_positive_classes / gt_classes))
+     log_string('Semantic Segmentation mAcc without ground points: {}'.format(np.mean(np.array(true_positive_classes)[sem_classcount_final] / np.array(gt_classes)[sem_classcount_final])))
+     log_string('Semantic Segmentation IoU without ground points: {}'.format(np.array(iou_list)[sem_classcount_final]))
+@@ -287,10 +387,10 @@ if __name__ == '__main__':
+     for i in range(NUM_CLASSES):
+         if gt_classes_bi[i] > 0:
+             sem_classcount_have_bi.append(i)
+-            iou = true_positive_classes_bi[i]/float(gt_classes_bi[i]+positive_classes_bi[i]-true_positive_classes_bi[i]) 
++            iou = true_positive_classes_bi[i]/float(gt_classes_bi[i]+positive_classes_bi[i]-true_positive_classes_bi[i])
+         else:
+             iou = 0.0
+-        iou_list_bi.append(iou)
++        iou_list_bi.append(float(iou))   # LOCAL PATCH: readable repr, as above
+         
+     sem_classcount_bi = [1, 2] 
+     set1 = set(sem_classcount_bi)
+@@ -335,8 +435,14 @@ if __name__ == '__main__':
+         ###### metrics for offset ######
+         if not tpsins[i_sem] or not fpsins[i_sem]:
+             continue
+-        tp = np.asarray(tpsins[i_sem]).astype(np.float)
+-        fp = np.asarray(fpsins[i_sem]).astype(np.float)
++        # LOCAL PATCH (SegmentedForests): np.float -> float. NumPy REMOVED the np.float /
++        # np.int / np.bool aliases in 1.24 (deprecated since 1.20); the host env has 2.5
++        # and the training image 1.24.4, so these two lines raised
++        # `AttributeError: module 'numpy' has no attribute 'float'` and killed the run at
++        # the instance metrics. Behaviour is identical -- numpy's own message says so.
++        # Same fix as in metrics/panoptic_tracker_pointgroup_treeins_partseg.py.
++        tp = np.asarray(tpsins[i_sem]).astype(float)
++        fp = np.asarray(fpsins[i_sem]).astype(float)
+         tp = np.sum(tp)
+         fp = np.sum(fp)
+         # recall and precision
 diff --git a/PointCloudSegmentation/torch_points3d/datasets/panoptic/treeins_set1.py b/PointCloudSegmentation/torch_points3d/datasets/panoptic/treeins_set1.py
-index 4fe0472..fa659cb 100644
+index 4fe0472..683dbe1 100644
 --- a/PointCloudSegmentation/torch_points3d/datasets/panoptic/treeins_set1.py
 +++ b/PointCloudSegmentation/torch_points3d/datasets/panoptic/treeins_set1.py
 @@ -18,12 +18,14 @@ from torch_points3d.models.panoptic.ply import read_ply, write_ply
@@ -129,7 +535,7 @@ index 4fe0472..fa659cb 100644
  }
  
  OBJECT_COLOR = np.asarray(
-@@ -32,13 +34,14 @@ OBJECT_COLOR = np.asarray(
+@@ -32,17 +34,30 @@ OBJECT_COLOR = np.asarray(
          [95, 156, 196],  # 'ground' .-> . blue
          [179, 116, 81],  # 'stem_points'  ->  brown
          [241, 149, 131],  # 'live_branches'  ->  salmon
@@ -147,7 +553,47 @@ index 4fe0472..fa659cb 100644
  
  
  ################################### UTILS #######################################
-@@ -102,20 +105,31 @@ def to_ins_ply(pos, label, file):
+ 
++# LOCAL PATCH (SegmentedForests): all three writers below emit BINARY PLY (text=False).
++# Upstream wrote ASCII (text=True), which at full resolution is both huge and slow. For
++# plot_01 (20.8 M points), `Semantic_results_forEval_0.ply` was 1.32 GB of text against
++# 333 MB binary. The first local eval, all ASCII, took 1 h 52 min; the next one, after
++# to_eval_ply alone went binary, took 34 min -- almost all of the difference was
++# formatting floats into text and pushing it through the Windows bind mount.
++# Nothing downstream needs text: tree_metrics/*.py, merge_tiles.py, the standalone
++# evaluation_stats*.py and our own `forainet_prep.py forainet_prep.mode=restore` all read
++# through plyfile, which handles ascii and binary alike. (evaluation_stats*.py do import
++# KPConv's read_ply, which rejects ascii -- but they never call it.) The f4 / u1 / int16
++# fields round-trip exactly.
++
+ def to_ply(pos, label, file):
+     assert len(label.shape) == 1
+     assert pos.shape[0] == label.shape[0]
+@@ -58,7 +73,7 @@ def to_ply(pos, label, file):
+     ply_array["green"] = colors[:, 1]
+     ply_array["blue"] = colors[:, 2]
+     el = PlyElement.describe(ply_array, 'vertex')
+-    PlyData([el], text=True).write(file)
++    PlyData([el], text=False).write(file)
+     print('out')
+ 
+ 
+@@ -77,7 +92,7 @@ def to_eval_ply(pos, pre_label, gt, file):
+     ply_array["preds"] = np.asarray(pre_label)
+     ply_array["gt"] = np.asarray(gt)
+     el = PlyElement.describe(ply_array, 'vertex')
+-    PlyData([el], text=True).write(file)
++    PlyData([el], text=False).write(file)
+ 
+ 
+ def to_ins_ply(pos, label, file):
+@@ -97,25 +112,36 @@ def to_ins_ply(pos, label, file):
+     ply_array["green"] = colors[:, 1]
+     ply_array["blue"] = colors[:, 2]
+     el = PlyElement.describe(ply_array, 'vertex')
+-    PlyData([el], text=True).write(file)
++    PlyData([el], text=False).write(file)
+ 
  
  # @Treeins: added parameter output_file_name because we now save several final evaluation files because we have several test files
  def final_eval(pre_sem, pre_ins_offset, pos, gt_sem, gt_ins, output_file_name):
@@ -184,6 +630,36 @@ index 4fe0472..fa659cb 100644
  
      # log directory
      # file_path = '/scratch2/torch-points3d/outputs/2021-10-20/06-19-43/eval/2021-10-26_14-27-55/'
+@@ -152,10 +178,13 @@ def final_eval(pre_sem, pre_ins_offset, pos, gt_sem, gt_ins, output_file_name):
+     # data_class = PlyData.read(pred_class_label_filename)
+     # data_ins = PlyData.read(pred_ins_label_filename)
+ 
+-    pred_ins_complete = np.asarray(pre_ins_offset).reshape(-1).astype(np.int)
+-    pred_sem_complete = np.asarray(pre_sem).reshape(-1).astype(np.int) + 1
+-    gt_ins_complete = np.asarray(gt_ins).reshape(-1).astype(np.int)
+-    gt_sem_complete = np.asarray(gt_sem).reshape(-1).astype(np.int) + 1
++    # LOCAL PATCH (SegmentedForests): np.int -> int, removed in numpy 1.24 (the image has
++    # 1.24.4). Same failure as the np.float pair in
++    # metrics/panoptic_tracker_pointgroup_treeins_partseg.py -- see the note there.
++    pred_ins_complete = np.asarray(pre_ins_offset).reshape(-1).astype(int)
++    pred_sem_complete = np.asarray(pre_sem).reshape(-1).astype(int) + 1
++    gt_ins_complete = np.asarray(gt_ins).reshape(-1).astype(int)
++    gt_sem_complete = np.asarray(gt_sem).reshape(-1).astype(int) + 1
+ 
+     # idxc = (gt_sem_complete!=0) | (pred_sem_complete!=0)
+     idxc = ((gt_sem_complete != 0) & (gt_sem_complete != 1)& (gt_sem_complete != 2)) | ((pred_sem_complete != 0) & (pred_sem_complete != 1)& (pred_sem_complete != 2))
+@@ -413,8 +442,9 @@ def final_eval(pre_sem, pre_ins_offset, pos, gt_sem, gt_ins, output_file_name):
+         ###### metrics for offset ######
+         if not tpsins[i_sem] or not fpsins[i_sem]:
+             continue
+-        tp = np.asarray(tpsins[i_sem]).astype(np.float)
+-        fp = np.asarray(fpsins[i_sem]).astype(np.float)
++        # LOCAL PATCH (SegmentedForests): np.float -> float, removed in numpy 1.24.
++        tp = np.asarray(tpsins[i_sem]).astype(float)
++        fp = np.asarray(fpsins[i_sem]).astype(float)
+         tp = np.sum(tp)
+         fp = np.sum(fp)
+         # recall and precision
 diff --git a/PointCloudSegmentation/torch_points3d/datasets/segmentation/treeins_set1.py b/PointCloudSegmentation/torch_points3d/datasets/segmentation/treeins_set1.py
 index da8e53f..5242246 100644
 --- a/PointCloudSegmentation/torch_points3d/datasets/segmentation/treeins_set1.py
@@ -214,6 +690,28 @@ index da8e53f..5242246 100644
          [0, 0, 0],  # unlabelled .->. black
      ]
  )
+diff --git a/PointCloudSegmentation/torch_points3d/metrics/panoptic_tracker_pointgroup_treeins_partseg.py b/PointCloudSegmentation/torch_points3d/metrics/panoptic_tracker_pointgroup_treeins_partseg.py
+index 47c89db..518a5c1 100644
+--- a/PointCloudSegmentation/torch_points3d/metrics/panoptic_tracker_pointgroup_treeins_partseg.py
++++ b/PointCloudSegmentation/torch_points3d/metrics/panoptic_tracker_pointgroup_treeins_partseg.py
+@@ -1058,8 +1058,15 @@ class PanopticTracker(SegmentationTracker):
+             ###### metrics for offset ######
+             if not tpsins[i_sem] or not fpsins[i_sem]:
+                 continue
+-            tp = np.asarray(tpsins[i_sem]).astype(np.float)
+-            fp = np.asarray(fpsins[i_sem]).astype(np.float)
++            # LOCAL PATCH (SegmentedForests): np.float -> float. NumPy REMOVED the
++            # np.float/np.int/np.bool aliases in 1.24 (deprecated since 1.20) and the
++            # training image ships numpy 1.24.4, so these two lines raise
++            # `AttributeError: module 'numpy' has no attribute 'float'`.
++            # Behaviour is identical -- numpy's own message says so -- but the crash is
++            # invisible until EPOCH 31: _compute_eval only runs once clustering starts
++            # (models: prepare_epoch: 30), which cost a full A100 run to discover.
++            tp = np.asarray(tpsins[i_sem]).astype(float)
++            fp = np.asarray(fpsins[i_sem]).astype(float)
+             tp = np.sum(tp)
+             fp = np.sum(fp)
+             # recall and precision
 diff --git a/PointCloudSegmentation/torch_points3d/models/panoptic/PointGroup3heads_ts.py b/PointCloudSegmentation/torch_points3d/models/panoptic/PointGroup3heads_ts.py
 new file mode 100644
 index 0000000..d265bb0
@@ -1049,6 +1547,269 @@ index 0000000..d265bb0
 +                            ['x', 'y', 'z', 'sem_label', 'ins_label','offset_x', 'offset_y', 'offset_z', 'center_x', 'center_y', 'center_z'])
 +                
 +            self.visual_count += 1
+diff --git a/PointCloudSegmentation/torch_points3d/modules/SparseConv3d/nn/torchsparse.py b/PointCloudSegmentation/torch_points3d/modules/SparseConv3d/nn/torchsparse.py
+index 7302607..bcdceb3 100644
+--- a/PointCloudSegmentation/torch_points3d/modules/SparseConv3d/nn/torchsparse.py
++++ b/PointCloudSegmentation/torch_points3d/modules/SparseConv3d/nn/torchsparse.py
+@@ -29,6 +29,41 @@ class Conv3dTranspose(TS.nn.Conv3d):
+         bias: bool = False,
+         transpose: bool = False,
+     ) -> None:
++        # LOCAL PATCH (SegmentedForests): a stride-1 "transpose" runs as a FORWARD conv.
++        # Without this, `ScorerUnet` dies with
++        # `KeyError: ((1, 1, 1), (3, 3, 3), (1, 1, 1), (1, 1, 1))`.
++        #
++        # `ResNetUp` inherits `ResNetDown.__init__` and reuses one `CONVOLUTION` attribute
++        # for BOTH its `conv_in` and its inner `ResBlock`s, so the blocks are built as
++        # transposed convs at stride 1 (`modules.py:29`). In TorchSparse 1.4 the transposed
++        # branch does a HARD lookup of the kernel map --
++        #     kmap = input.kmaps[(tensor_stride, kernel_size, stride, dilation)]   # conv.py:134
++        # `[]`, not `.get()` -- so it requires a forward conv to have built that map first.
++        # The forward branch builds its own map on demand; only the transposed one assumes.
++        #
++        #   backbone     down_conv.stride [1,2,2,...]  the stride-1 stem runs a kernel-3 conv
++        #                at tensor_stride (1,1,1) and registers that map, so its last
++        #                ResNetUp's blocks find it. Works.
++        #   scorer_unet  down_conv.stride 2            the encoder never operates at stride 1,
++        #                so the map is never built and the last ResNetUp's blocks raise.
++        #
++        # This is the same asymmetry as the `cmaps` seed in `SparseTensor()` below, one level
++        # deeper: `up[1].conv_in` (a real stride-2 transpose) needs the seeded coordinate map,
++        # and `up[1].blocks` (stride 1) need this. BOTH fixes are required.
++        #
++        # Why running them forward is equivalent: at stride 1 the output lives on the input's
++        # own coordinates either way. Forward computes `out[p] = sum_o W[o] * in[p+o]`,
++        # transposed computes `out[p] = sum_o W[o] * in[p-o]` -- the offset set is symmetric
++        # under negation, so the two differ only by a 180-degree flip of a LEARNED kernel.
++        # Identical shapes, identical capacity, and `path_pretrained: null` means no
++        # checkpoint exists whose weights would care about the orientation.
++        #
++        # Not bitwise identical to the MinkowskiEngine model, whose coordinate manager builds
++        # kernel maps on demand and so keeps the transpose at every stride. The two backends
++        # already differ in map construction and GEMM ordering; this sits inside that gap.
++        # It also affects the TS backbone's decoder blocks, which work today -- accepted,
++        # because the alternative is stateful conditional logic in this shim.
++        strided = any(s != 1 for s in stride) if isinstance(stride, (tuple, list)) else stride != 1
+         super().__init__(
+             in_channels,
+             out_channels,
+@@ -36,7 +71,7 @@ class Conv3dTranspose(TS.nn.Conv3d):
+             stride=stride,
+             dilation=dilation,
+             bias=bias,
+-            transposed=True,
++            transposed=strided,
+         )
+ 
+ 
+@@ -65,4 +100,37 @@ def SparseTensor(feats, coordinates, batch, device=torch.device("cpu")):
+     if batch.dim() == 1:
+         batch = batch.unsqueeze(-1)
+     coords = torch.cat([coordinates.int(), batch.int()], -1)
+-    return TS.SparseTensor(feats, coords).to(device)
++    x = TS.SparseTensor(feats, coords).to(device)
++
++    # LOCAL PATCH (SegmentedForests): register this tensor's OWN coordinate map before
++    # handing it to a network. Without it, `ScorerUnet` dies with `KeyError: (1, 1, 1)`.
++    #
++    # How TorchSparse 1.4.0 tracks coordinates: every conv ends with
++    #     output.cmaps.setdefault(output.stride, output.coords)
++    # -- it records the stride it PRODUCED, never the one it consumed. A transposed conv
++    # then recovers the finer resolution by looking the parent up:
++    #     output = SparseTensor(coords=input.cmaps[tensor_stride], ...)   # conv.py:140
++    # so a decoder can only un-stride back to resolutions the encoder actually wrote.
++    #
++    # `TS.SparseTensor(feats, coords)` starts with `cmaps == {}` at stride (1,1,1), so
++    # whether (1,1,1) is ever written depends on the first conv's stride:
++    #
++    #   backbone     down_conv.stride [1,2,2,...]  first conv is stride 1, so output.stride
++    #                == input.stride == (1,1,1) and the setdefault registers it. Its last
++    #                ResNetUp (stride 1) then finds (1,1,1). Works -- which is why epochs
++    #                1-30 train fine.
++    #   scorer_unet  down_conv.stride 2            first conv jumps straight to (2,2,2);
++    #                cmaps only ever holds (2,2,2) and (4,4,4). Its last ResNetUp goes
++    #                2 -> 1 and raises KeyError: (1, 1, 1).
++    #
++    # The crash is invisible until EPOCH 31 because ScorerUnet is gated behind
++    # `prepare_epoch: 30` -- epoch 31 is the first time the module runs at all.
++    #
++    # MinkowskiEngine has no such failure: its coordinate manager regenerates parent
++    # coordinates on demand, so `model_name=PointGroup-PAPER` never needed this.
++    #
++    # Seeding the entry here is a no-op for the backbone -- a stride-1 conv would have
++    # setdefault'ed the identical `coords` tensor anyway -- and it propagates for free,
++    # since `output.cmaps = input.cmaps` shares one dict across the whole forward pass.
++    x.cmaps.setdefault(x.stride, x.coords)
++    return x
+diff --git a/PointCloudSegmentation/torch_points3d/utils/meanshift_cluster.py b/PointCloudSegmentation/torch_points3d/utils/meanshift_cluster.py
+index 3aba730..0d071e9 100644
+--- a/PointCloudSegmentation/torch_points3d/utils/meanshift_cluster.py
++++ b/PointCloudSegmentation/torch_points3d/utils/meanshift_cluster.py
+@@ -1,3 +1,6 @@
++import atexit
++import os
++
+ import numpy as np
+ import torch
+ import torch
+@@ -6,6 +9,59 @@ import time
+ import multiprocessing
+ from multiprocessing import Process
+ from functools import partial
++
++# ---------------------------------------------------------------------------
++# LOCAL PATCH (SegmentedForests): ONE worker pool for the whole process.
++#
++# Upstream builds and tears down a `multiprocessing.Pool` inside `cluster_single`,
++# i.e. on EVERY forward pass. Once `prepare_epoch: 30` opens the instance branch that
++# is ~196 pool create/destroy cycles per epoch (188 train + 2 val + 6 test), each
++# forking up to `batch_size` copies of an ~8 GB process holding a live CUDA context.
++# The forks themselves are pure overhead: the work each child does is a few hundred
++# milliseconds of sklearn on a numpy array.
++#
++# This changes only the LIFETIME of the workers, never the result:
++#   * `pool.map` returns results in input order, and
++#   * `MeanShift(bandwidth, bin_seeding=True)` is deterministic for a given input,
++# so the clusters handed back are identical to what upstream produced.
++#
++# Sized once instead of from `unique_in_batch.shape[0]` -- `pool.map` distributes
++# however many tasks it is given, so a fixed pool handles a varying batch fine. The
++# cap keeps us from oversubscribing: each worker runs single-threaded sklearn
++# (`n_jobs` is deliberately left unset in `meanshift_cluster`).
++#
++# Forking once is as safe as forking 780 times an epoch, which is what happens today:
++# the children touch only numpy arrays through sklearn and never CUDA.
++_POOL = None
++
++
++def _get_pool():
++    """The process-wide mean-shift worker pool, created on first use."""
++    global _POOL
++    if _POOL is None:
++        # Prefer an explicit "fork" context rather than the platform default: the
++        # training container is Linux, and fork keeps the children cheap (copy-on-write)
++        # and free of a re-import of the torch stack. Fall back where fork does not
++        # exist -- Windows, and macOS spawn-by-default -- so merely importing this
++        # module stays harmless off the training box, as it was with upstream's plain
++        # `multiprocessing.Pool(...)`.
++        try:
++            ctx = multiprocessing.get_context("fork")
++        except ValueError:
++            ctx = multiprocessing.get_context()
++        _POOL = ctx.Pool(processes=min(os.cpu_count() or 1, 8))
++        atexit.register(_close_pool)
++    return _POOL
++
++
++def _close_pool():
++    global _POOL
++    if _POOL is not None:
++        _POOL.close()
++        _POOL.join()
++        _POOL = None
++
++
+ def meanshift_cluster(prediction, bandwidth):
+     bandwidth = bandwidth #0.6
+     ms = MeanShift(bandwidth=bandwidth,bin_seeding=True) #, n_jobs=-1)
+@@ -48,24 +104,24 @@ def cluster_loop(embed_logits_logits_u, unique_in_batch, label_batch, local_ind,
+                 all_clusters.append(sample_embed_logits.cpu().detach().numpy())
+                 cluster_type_loop.append(loop_i)
+     
+-    if unique_in_batch.shape[0]>0:
+-        processes=unique_in_batch.shape[0]
+-    else:
+-        processes=1
+-    with multiprocessing.Pool(processes=processes) as pool:
+-        results = pool.map(meanshift_cluster, all_clusters)
+-        for i in range(len(results)):
+-            pre_ins_labels_embed = results[i]
+-            sampleInBatch_local_ind = local_logits[i]
+-            loop_i_ = cluster_type_loop[i]
+-            unique_preInslabels = torch.unique(pre_ins_labels_embed)
+-            for l in unique_preInslabels:
+-                if l == -1:
+-                    continue
+-                label_mask_l = pre_ins_labels_embed == l
+-                final_result.append(sampleInBatch_local_ind[label_mask_l])
+-                cluster_type.append(loop_i_)
+-    
++    # LOCAL PATCH (SegmentedForests): same shared-pool change as in `cluster_single`.
++    # NOTE this function is DEAD CODE on every config we run -- `_cluster3` through
++    # `_cluster7` in both PointGroup3heads.py and PointGroup3heads_ts.py call
++    # `cluster_single`, and nothing calls this except the `__main__` benchmark below.
++    # Kept in step so the two do not drift.
++    results = _get_pool().map(meanshift_cluster, all_clusters)
++    for i in range(len(results)):
++        pre_ins_labels_embed = results[i]
++        sampleInBatch_local_ind = local_logits[i]
++        loop_i_ = cluster_type_loop[i]
++        unique_preInslabels = torch.unique(pre_ins_labels_embed)
++        for l in unique_preInslabels:
++            if l == -1:
++                continue
++            label_mask_l = pre_ins_labels_embed == l
++            final_result.append(sampleInBatch_local_ind[label_mask_l])
++            cluster_type.append(loop_i_)
++
+     #print("total time",time.time()-t)
+     return final_result, cluster_type
+ 
+@@ -93,31 +149,29 @@ def cluster_single(embed_logits_logits_u, unique_in_batch, label_batch, local_in
+             #normalize(sample_embed_logits, axis=0)
+     
+     partial_meanshift_cluster = partial(meanshift_cluster, bandwidth=bandwidth)
+-    if unique_in_batch.shape[0]>0:
+-        processes=unique_in_batch.shape[0]
+-    else:
+-        processes=1
+-    with multiprocessing.Pool(processes=processes) as pool:
+-        results = pool.map(partial_meanshift_cluster, all_clusters)
+-        for i in range(len(results)):
+-            pre_ins_labels_embed = results[i]
+-            sampleInBatch_local_ind = local_logits[i]
+-            unique_preInslabels = torch.unique(pre_ins_labels_embed)
+-            for l in unique_preInslabels:
+-                if l == -1:
+-                    continue
+-                label_mask_l = pre_ins_labels_embed == l
+-                final_result.append(sampleInBatch_local_ind[label_mask_l])
+-                cluster_type.append(type)        
+-            
+-            #pre_ins_labels_embed = hdbscan_cluster(sample_embed_logits)
+-            #unique_preInslabels = torch.unique(pre_ins_labels_embed)
+-            #for l in unique_preInslabels:
+-            #    if l == -1:
+-            #        continue
+-            #    label_mask_l = pre_ins_labels_embed == l
+-            #    all_clusters.append(sampleInBatch_local_ind[label_mask_l])
+-            #    cluster_type.append(type)
++    # LOCAL PATCH (SegmentedForests): reuse the process-wide pool instead of building
++    # and destroying one here on every forward pass. See _get_pool() at the top of the
++    # file. `pool.map` is order-preserving, so the loop below is unchanged.
++    results = _get_pool().map(partial_meanshift_cluster, all_clusters)
++    for i in range(len(results)):
++        pre_ins_labels_embed = results[i]
++        sampleInBatch_local_ind = local_logits[i]
++        unique_preInslabels = torch.unique(pre_ins_labels_embed)
++        for l in unique_preInslabels:
++            if l == -1:
++                continue
++            label_mask_l = pre_ins_labels_embed == l
++            final_result.append(sampleInBatch_local_ind[label_mask_l])
++            cluster_type.append(type)
++
++        #pre_ins_labels_embed = hdbscan_cluster(sample_embed_logits)
++        #unique_preInslabels = torch.unique(pre_ins_labels_embed)
++        #for l in unique_preInslabels:
++        #    if l == -1:
++        #        continue
++        #    label_mask_l = pre_ins_labels_embed == l
++        #    all_clusters.append(sampleInBatch_local_ind[label_mask_l])
++        #    cluster_type.append(type)
+                 
+     #print("total time",time.time()-t)
+     return final_result, cluster_type
 diff --git a/PointCloudSegmentation/train.py b/PointCloudSegmentation/train.py
 index c7cbd87..a0c1da2 100644
 --- a/PointCloudSegmentation/train.py

@@ -412,6 +412,9 @@ with the 96 from the matching down-level.
 `Model size = 11872126` ≈ **11.9 M parameters**, and remember ~a third of that is
 `ScorerEncoder` + `ScorerMLP`, which this config never calls.
 
+> This log predates the 4-class patch. A current run prints **`11872109`** — 17 fewer,
+> which is exactly one output of the `Linear(16→N)` semantic head (16 weights + 1 bias).
+
 ## B3. Dataset summary
 
 ```

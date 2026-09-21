@@ -200,6 +200,24 @@ ForAINet ships a pretrained checkpoint `PointGroup-PAPER.pt` you can download in
 training from scratch.
 **Learn more:** [PyTorch — saving & loading models](https://pytorch.org/tutorials/beginner/saving_loading_models.html)
 
+#### Model selection & "best" checkpoints
+**In plain English:** during training the model is scored on the **validation** set after
+every epoch, and a snapshot is saved each time a score reaches a new high. So at the end
+you don't have *one* trained model — you have candidates: the **latest** one (the last
+epoch) and a **"best"** one per score. Choosing between them is **model selection**. The
+catch: a "best" snapshot was picked *because* it looked good on the validation data, so
+its validation score flatters it — like a student choosing which practice exam to show
+you. That is why the **test** set exists: data that took part in no decision at all, so
+its score is honest.
+**In this project:** each file in `ForAINet/pre-trained_models/` holds 22 weight sets —
+`latest` (epoch 99) plus 21 `best_<metric>` snapshots, all chosen on `plot_11_val`
+([base_dataset.py:519-521](../ForAINet/PointCloudSegmentation/torch_points3d/datasets/base_dataset.py#L519-L521)).
+`weight_name` in [eval.yaml](../ForAINet/PointCloudSegmentation/conf/eval.yaml) picks one.
+A real trap: the TorchSparse model's `best_miou` comes from epoch 22 — *before* its
+instance-scoring head started learning at epoch 30 — so that "best" snapshot is actually
+broken at finding trees. See [eval_process.md](eval_process.md) §9.
+**Learn more:** [Google ML Crash Course — Dividing the original dataset](https://developers.google.com/machine-learning/crash-course/overfitting/dividing-datasets)
+
 #### GPU / CUDA & mixed precision
 **In plain English:** a **GPU** is a graphics card, but it's also brilliant at the many
 parallel multiplications neural nets need — often 10–100× faster than a CPU. **CUDA** is
@@ -232,6 +250,21 @@ intuitive — but misleading when classes are imbalanced (if 95% of points are "
 a lazy model that always says "ground" scores 95% while being useless). That's why we
 also use the metrics below.
 **Learn more:** [Accuracy, precision, recall (Google ML Crash Course)](https://developers.google.com/machine-learning/crash-course/classification/accuracy)
+
+#### Class imbalance
+**In plain English:** a dataset is **imbalanced** when some classes have far more examples
+than others — the *majority* and *minority* classes. It changes what the scores mean. A big
+class is easy to score well on: its region is large and connected, so a few mistakes barely
+dent its IoU. A small class loses a lot of IoU for every confused point. So the *same* model
+can score very differently on two classes without anything being broken. It is also why
+**mIoU**, where every class counts equally, is more honest than plain **accuracy**, where
+every point counts equally.
+**In this project:** on plot_14, `live_branches` (tree crowns) is **68.8%** of the points
+and `ground` only **4.3%** — a thin sheet at the same height as low vegetation. The model
+scores IoU **0.97** on live_branches and **0.65** on ground. On plot_01, where ground is
+22.9% of the points, its IoU rises to 0.82. The scores come from the `Evaluation_<i>.txt`
+reports described in [eval_process.md](eval_process.md) §10.
+**Learn more:** [Google ML Crash Course — Class-imbalanced datasets](https://developers.google.com/machine-learning/crash-course/overfitting/imbalanced-datasets)
 
 #### IoU / mIoU
 **In plain English:** **IoU** (Intersection over Union) measures overlap between the
@@ -266,6 +299,21 @@ confused with what*. Great for seeing *which* mistakes a model makes, not just h
 **In this project:** accumulated during evaluation by the metrics tracker to compute
 per-class IoU/accuracy.
 **Learn more:** [Confusion matrix (StatQuest, YouTube)](https://www.youtube.com/watch?v=Kdsp6soqA7o)
+
+#### Reproducibility (why one number is not a result)
+**In plain English:** before you say "model A beats model B", check that running the *same*
+model twice gives the *same* number. If it does not, the gap you are looking at might be
+noise rather than a real difference. Two things cause wobble. Some GPU maths adds numbers
+in a different order each time, which nudges results slightly. More often something in the
+*pipeline* differs between the runs — a cached intermediate file that one run wrote and the
+next merely read, a changed preprocessing step, a different subset of files. The habit:
+repeat one setup before comparing two.
+**In this project:** three repeats of each backbone produced byte-identical
+`Evaluation_<i>.txt`, so the MinkowskiEngine-vs-TorchSparse gap is real. But the run that
+*built* the `processed_0.2_test/` cache and the runs that *loaded* it disagree by up to
+0.053 in instance recall — two reproducible regimes, and only same-regime runs may be
+compared. See [eval_process.md](eval_process.md) §11.
+**Learn more:** [PyTorch — Reproducibility](https://docs.pytorch.org/docs/stable/notes/randomness.html)
 
 ---
 

@@ -613,6 +613,620 @@ Dates follow the Hydra run logs in `outputs/<date>/<time>/`.
   dev box); `PREFLIGHT_PLOTS`, `PREFLIGHT_EPOCHS`, `PREFLIGHT_SKIP_TRAIN`, `PREFLIGHT_WANDB`
   tune scope/cost. Registered in `container_export/README.md`.
 
+## 2026-08-27 — The pre-flight meets a real rented box: five fixes, one of them serious
+
+First live run of `preflight.sh` on a Vast.ai **RTX 3090** ("forainet" template). It ended
+`4 × FAIL` — and, far worse, **2 × OK that were false**. Every fix below is in the script;
+`docs/preflight_cheap_gpu.md` gained a §2b describing the self-healing and three
+troubleshooting entries.
+
+- **The false pass (the one that mattered).** `run_sh` executed pipelines through
+  `bash -c "$1"`, and a fresh `bash` does **not** inherit `set -o pipefail` from line 47. So
+  `train.py … | tee log` reported *tee's* exit status: both training runs died on
+  `python3.8: can't open file 'train.py'` and both were summarised as
+  `[OK] … finished 2 epoch(s)`. A gate that green-lights a $16–30 A100 run after the training
+  step never started is worse than no gate. Now `bash -o pipefail -c`, **and** a run only
+  counts if its log contains the trainer's own `EPOCH n / m` line (`trainer.py:154`) — an
+  exit status alone is not evidence.
+- **The image is environment-only** — no `/workspace/PointCloudSegmentation/train.py`, because
+  locally the code arrives through the `./ForAINet:/workspace` bind mount that a rented host
+  cannot have. The old advice ("rebuild the image with `COPY ForAINet/ /workspace/`") is
+  useless while the meter is running, so step B now *locates* the tree (6 candidate paths, then
+  a bounded `find`) and, failing that, **clones `prs-eth/ForAINet` at the pinned `5fe600a`**.
+  Measured: a shallow fetch of that exact SHA is **16 MB in ~1 s**, GitHub serves it, and
+  `git apply` of `patches/forainet-local.patch` then succeeds on the fresh tree
+  (`Treeins_NUM_CLASSES = 4`, `PointGroup3heads_ts.py` present) — all verified end-to-end
+  locally. Because a clone lands at `/workspace/ForAINet/`, one level deeper than the bind
+  mount, `RAW`/`CACHE`/`SEG_DS`/`TS_MODEL` are no longer constants: `set_paths()` re-derives
+  them from wherever the tree was found, and the summary prints all three resolved paths.
+- **Archive layout.** The uploaded `container_export.tar.gz` nests everything under
+  `container_export/` (packed as `tar -czf x.tgz container_export`, not `-C container_export .`),
+  so the converter, the patch and `smoke_test.py` were all "missing" at `/opt/prep/…` — three
+  of the four FAILs. Step D still converted 14 clouds, purely because the operator had `cd`-ed
+  into the nested folder and cwd rescued the import. `resolve_prep_root()` now searches for
+  `*/pipeline/convert.py`, so both layouts work.
+- **`import debugpy`.** The patch adds it to `train.py` for local VSCode debugging (the
+  `breakpoint()` calls are already commented out, but the import is not). Applying the patch on
+  a box without debugpy would have turned "no train.py" into an `ImportError` at startup —
+  the exact failure `patches/README.md` warns about. `strip_debugpy()` deletes that one line
+  when debugpy is not importable, and leaves it alone when it is.
+- **laspy predates `header.parse_crs`** on this image — one `could not parse CRS` warning per
+  plot during conversion. Harmless (our clouds carry no CRS, and `_crs_wkt` tries the WKT VLR
+  first) but `smoke_test.py:60` *asserts* it, so step C would have hard-failed on a working
+  box. New step **B2** probes the LAZ backend + `parse_crs`, installs `laspy[lazrs]` when
+  either is missing — deliberately **without** `Dockerfile.train`'s `numpy==1.24.4` pin, which
+  is only correct for the known base image — then re-checks that numpy/torch still import. If
+  the repair is off or fails, a smoke-test failure whose only cause is `parse_crs` is recorded
+  as WARN, not FAIL.
+- New opt-outs, all self-heal on by default: `PREFLIGHT_NO_CLONE`, `PREFLIGHT_NO_PIP`,
+  `PREFLIGHT_FORAINET_DIR` / `_REF` / `_URL`.
+- Verified before shipping: `bash -n`; a sandbox harness exercising `resolve_prep_root`
+  (nested/flat/absent), `locate_forainet` (explicit dir, `NO_CLONE` refusal) and
+  `strip_debugpy` (removes, idempotent, keeps when debugpy exists); a real clone + patch +
+  reverse-check + strip against a fresh `5fe600a` tree; and `PREFLIGHT_DRYRUN=1` still exits 0.
+
+## 2026-08-28 — Pre-flight: a pinned laspy, and the dataset is fetched once
+
+Two changes to `container_export/preflight.sh`, both aimed at the cost of *re-running* the
+gate (which is the normal case — a cheap box exists to be iterated on).
+
+- **laspy is pinned to `2.5.3`.** Step B2 installed `laspy[lazrs]` with `--upgrade`, so two
+  runs of the same gate could end up on two different readers — the one thing a
+  reproducibility gate must not do. `$LASPY_SPEC` (`PREFLIGHT_LASPY_SPEC`, default
+  `laspy[lazrs]==2.5.3`) now drives the install, and the *version* joins the LAZ-backend and
+  `header.parse_crs` probes in deciding whether to install at all: a floating 2.6 and a
+  2.0.3-with-lazrs-bolted-on both converge on 2.5.3. If the pin can't be satisfied (an
+  unexpected Python), it retries unpinned and WARNs rather than failing — a working laspy
+  still beats none — and a version mismatch is likewise a WARN, since the gate is about
+  capabilities. Dropping the `==` from the spec disables the version check entirely.
+  `Dockerfile.train` still installs `laspy[lazrs]` unpinned; if the image is ever rebuilt,
+  pinning it there too would stop B2 reinstalling laspy on every run of a fresh image.
+- **`$DATASET_TRAIN_URL` is downloaded once, then checksum-verified.** 4.3 GB was being
+  re-pulled on every run. After a good extraction, step D writes
+  `.preflight_manifest.sha256` (sha256 per extracted file, paths relative to `$DATA`) and
+  `.preflight_source` (the URL) *inside* `/data`; the next run verifies the manifest and
+  skips the download. Checksums, not sizes or timestamps: a truncated `.laz` from an
+  interrupted extraction has a plausible size and would otherwise reach the converter. A
+  changed URL, a missing file, one bad checksum, or `PREFLIGHT_FORCE_FETCH=1` re-downloads.
+  A `/data` with clouds but no manifest is adopted once with a WARN and then manifested
+  (`PREFLIGHT_ADOPT_EXISTING=0` to refuse). `$DATASET_PATCH` is deliberately **not** cached —
+  ~50 KB, and it is the archive you iterate on; a stale copy would defeat the re-run.
+- Two supporting changes: `$DATA`/`$PREP` are overridable (`PREFLIGHT_DATA_DIR`,
+  `PREFLIGHT_PREP_DIR`) so the gate can run outside a container's root filesystem — which is
+  also what made the cache testable on the dev box — and an **empty** backend list from the
+  laspy probe (interpreter missing, import crashed) is now a FAIL like `NONE`, instead of
+  passing as "LAZ backend available ()".
+- Verified on the dev box with a fake dataset archive over `file://`: fresh fetch writes 4
+  checksums; re-run skips the download; appending one byte to a `.laz` prints
+  `./plot_02.laz: FAILED` and re-downloads; `PREFLIGHT_FORCE_FETCH=1` ignores a good cache;
+  deleting the manifest adopts-with-WARN (and refuses under `ADOPT_EXISTING=0`); a changed
+  URL re-downloads; `PREFLIGHT_DRYRUN=1` still exits 0. Plus `bash -n`.
+
+## 2026-08-29 — The TorchSparse block never parsed in the image (a YAML merge key)
+
+First full pre-flight on the local container got through clone, patch, laspy, the smoke test
+and the conversion, then **both** training runs died identically:
+
+```
+yaml.constructor.ConstructorError: could not determine a constructor for the tag
+'tag:yaml.org,2002:merge' in ".../conf/models/panoptic/FORpartseg_3heads.yaml", line 210
+```
+
+- **Cause, ours not the environment's.** The TorchSparse block added in `cc5e0d9` was
+  `PointGroup-PAPER-TS: {<<: *paper, class: …, backend: torchsparse}`. A merge key cannot be
+  loaded by omegaconf 2.0.x, which `hydra-core==1.0.7` pins in the image: its loader calls
+  `construct_object()` on every key node and registers nothing for
+  `tag:yaml.org,2002:merge`. The failure is at *parse* time, so hydra never reads
+  `model_name` and **both** backbones die with an error that names neither — which is why the
+  Minkowski run failed too.
+- **Why it shipped.** omegaconf **2.3** (the `aifor` env) replaced that loader with a
+  `construct_mapping` override that skips non-scalar keys and lets PyYAML expand merges. The
+  file is valid on the dev machine and invalid in the container; every local check used the
+  dev machine. Reproduced offline by re-implementing 2.0's loader
+  (`_loads_under_omegaconf_20`), which fails on the old file and passes on the new one.
+- **Fix:** `PointGroup-PAPER-TS` is now a full copy of `PointGroup-PAPER` (the `&paper`
+  anchor is gone), differing only in `class` and `backend`. Its three
+  `${models.PointGroup-PAPER.feat_size}` interpolations were retargeted to its own block, so
+  the copy is self-consistent if the two ever diverge.
+- **Guards, because duplication drifts.** `misc/check_forainet_classes.py` gained two checks:
+  the model config parses under 2.0 semantics, and the TS block equals the PAPER block except
+  `class`/`backend` (own-block interpolations normalised before comparing). Both were
+  negative-tested against a re-introduced merge key and a hand-drifted `prepare_epoch`.
+  `preflight.sh` now loads the three patched configs with the image's own omegaconf
+  immediately after applying the patch — a second, instead of discovering it after the 4.3 GB
+  download and a 2.5-minute conversion.
+- **A gate bug the same run exposed:** the post-run log greps ran unconditionally, so two runs
+  that never built a model still produced `[OK] no Minkowski deprecation warning on run 2
+  (TorchSparse active)` — a log with no deprecation warning because there is no log. Both grep
+  blocks are now gated on `trained <log>`, the same evidence rule the `EPOCH n / m` check uses.
+- `patches/forainet-local.patch` regenerated (reverses cleanly against the working tree),
+  copied into `container_export/patches/`, and `container_export.tar.gz` repacked — the R2
+  copy must be re-uploaded before the next run on a box.
+
+## 2026-08-29 — Epoch 31 on the A100: `np.float` was removed in numpy 1.24
+
+The first real A100 run died at **epoch 31 / 100** with wandb showing `failed`. Cause, from
+the traceback:
+
+```
+File ".../metrics/panoptic_tracker_pointgroup_treeins_partseg.py", line 1061, in _compute_eval
+    tp = np.asarray(tpsins[i_sem]).astype(np.float)
+AttributeError: module 'numpy' has no attribute 'float'
+```
+
+- **Why numpy.** `np.float` / `np.int` / `np.bool` were deprecated in numpy 1.20 and
+  **removed in 1.24**. The image ships **1.24.4** (`Dockerfile.train` pins it, and the base
+  already had it), so these lines cannot run there at all. Nothing to do with memory, the
+  GPU, or Vast.
+- **Why epoch 31, and why that is the expensive part.** `models: prepare_epoch: 30` gates
+  every instance-segmentation path: `forward` only clusters when `epoch > prepare_epoch`,
+  and the tracker's `_compute_eval` — where the alias lives — only runs once there are
+  clusters to score. So epochs 1–30 execute a strict subset of the code, and a one-word
+  API removal survives ~7 hours of paid A100 time before killing the run. Same shape as the
+  YAML merge key: a defect that startup checks cannot see.
+- **Fix:** 8 lines, all mechanical (`astype(np.float)` → `astype(float)`,
+  `astype(np.int)` → `astype(int)`), in the two files on this config's code path —
+  `metrics/panoptic_tracker_pointgroup_treeins_partseg.py` (2) and
+  `datasets/panoptic/treeins_set1.py` (6). Behaviour is identical; numpy's own error
+  message says so. The tree carries ~90 more occurrences in datasets and trackers this
+  config never loads (npm3d, s3dis, stpls3d, treeins set2/3) — deliberately left alone.
+- **Guard:** `preflight.sh` step B now greps those three code-path files for removed
+  aliases whenever the installed numpy is ≥ 1.24, and FAILs with the epoch number the
+  crash would land on. Milliseconds, before anything is rented. Negative-tested against the
+  unpatched upstream files: it flags all 8 lines, including 1061.
+- Patch regenerated (reverses cleanly), `container_export/patches/` synced,
+  `container_export.tar.gz` repacked (112 KB) — **must be re-uploaded to R2**.
+- **Resume, do not restart:** `trainer.py:153` runs from `self._checkpoint.start_epoch` and
+  `resume` is just `bool(cfg.training.checkpoint_dir)`, so pointing
+  `training.checkpoint_dir` at the failed run's directory picks up at epoch 31 from
+  `PointGroup-PAPER.pt` instead of repeating the 30 good epochs.
+
+---
+
+## 2026-09-01 — Epoch 31 again, TorchSparse this time: `KeyError: (1, 1, 1)`
+
+With the numpy aliases fixed, the **MinkowskiEngine** run cleared epoch 31 and kept going.
+The **TorchSparse** run then died at the same epoch, on an unrelated defect:
+
+```
+File ".../models/panoptic/PointGroup3heads_ts.py", line 552, in _compute_score
+    score_backbone_out = self.ScorerUnet(batch_cluster)
+File ".../torchsparse/nn/functional/conv.py", line 140, in conv3d
+    output = SparseTensor(coords=input.cmaps[tensor_stride],
+KeyError: (1, 1, 1)
+```
+
+- **How TorchSparse 1.4 tracks coordinates.** Every `conv3d` ends with
+  `output.cmaps.setdefault(output.stride, output.coords)` — it records the stride it
+  *produced*, never the one it consumed. A transposed conv recovers the finer resolution
+  with `input.cmaps[tensor_stride]`, so a decoder can only un-stride back to resolutions
+  the encoder actually wrote. `TS.SparseTensor(feats, coords)` starts with `cmaps == {}`.
+- **Why only the scorer.** It is decided entirely by the first conv's stride:
+
+  | module | `down_conv.stride` | first conv | `cmaps` after the encoder | last `ResNetUp` needs |
+  |---|---|---|---|---|
+  | `backbone` | `[1,2,2,2,2,2,2]` | stride 1, so `output.stride == input.stride` | `(1,1,1)` … `(64,64,64)` | `(1,1,1)` ✓ |
+  | `scorer_unet` | `2` | stride 2, jumps straight past the input resolution | `(2,2,2)`, `(4,4,4)` | `(1,1,1)` ✗ |
+
+  MinkowskiEngine never hits this — its coordinate manager regenerates parent coordinates
+  on demand — which is why `model_name=PointGroup-PAPER` runs fine on the identical config.
+- **Why epoch 31 *again*, for a completely different reason.** `prepare_epoch: 30` gates
+  `_compute_score`, so epoch 31 is simply the first time `ScorerUnet` executes at all. Two
+  independent defects (numpy alias, TorchSparse cmaps) both hid behind the same gate. Any
+  bug in the scorer or the instance tracker costs 30 epochs of paid GPU time to reach.
+- **Fix:** one line in `modules/SparseConv3d/nn/torchsparse.py` — the `SparseTensor()`
+  factory now does `x.cmaps.setdefault(x.stride, x.coords)` before returning. It is a no-op
+  for the backbone (its stride-1 first conv would `setdefault` the identical tensor) and
+  propagates for free, since `output.cmaps = input.cmaps` shares one dict across the whole
+  forward pass. Nothing about the computation changes.
+- Patch regenerated — 8 → **9 files**, reverses cleanly and applies to a pristine `5fe600a`.
+  `container_export/patches/` synced, `container_export.tar.gz` repacked (114 KB) —
+  **must be re-uploaded to R2.** Both `patches/README.md` tables also gained the missing
+  row for the numpy-alias file, which was never listed.
+- **Verify without renting 30 epochs:** `models.PointGroup-PAPER-TS.prepare_epoch=0` forces
+  the scorer to run on epoch 1, so a 2-epoch local run exercises the exact path that was
+  crashing. Worth doing before any paid run — and worth considering as a permanent
+  pre-flight step, the way `preflight.sh` now greps for the numpy aliases.
+
+---
+
+## 2026-09-01 — The same TorchSparse asymmetry, one level deeper: the kernel map
+
+The `cmaps` seed worked — and the crash moved four lines down, from `modules.py:139`
+(`conv_in`) to `modules.py:141` (`self.blocks`), and from a coordinate-map lookup to a
+kernel-map one:
+
+```
+torchsparse/nn/functional/conv.py:134
+    kmap = input.kmaps[(tensor_stride, kernel_size, stride, dilation)]
+KeyError: ((1, 1, 1), (3, 3, 3), (1, 1, 1), (1, 1, 1))
+```
+
+- **Why there were two.** `ScorerUnet`'s encoder starts at stride 2, so nothing in it ever
+  operates at the input resolution — and TorchSparse 1.4 records only what a conv
+  *produces*. Its decoder needs two things at stride (1,1,1) that were therefore never
+  built: the coordinate map (fixed by the seed) and the **kernel** map. The backbone's
+  stride-1 stem builds both, which is why only the scorer breaks.
+- **Where the stride-1 transpose comes from.** `ResNetUp` inherits `ResNetDown.__init__`
+  and reuses a single `CONVOLUTION` attribute for *both* `conv_in` and its inner
+  `ResBlock`s, so the blocks are built as transposed convs at stride 1
+  (`modules.py:29`). TorchSparse's transposed branch looks the kernel map up with `[]`, not
+  `.get()` — it assumes a forward conv built it. The forward branch builds on demand.
+- **Fix:** `Conv3dTranspose` in the shim now passes `transposed=(stride != 1)`. At stride 1
+  the output lives on the input's own coordinates either way; forward is
+  `out[p] = Σ W[o]·in[p+o]`, transposed is `out[p] = Σ W[o]·in[p−o]`, and the offset set is
+  symmetric under negation — so they differ only by a 180° flip of a **learned** kernel.
+  Same shapes, same capacity, and `path_pretrained: null` means no checkpoint exists whose
+  weights would care about the orientation.
+- **What this costs.** It is *not* bitwise identical to MinkowskiEngine, whose coordinate
+  manager builds kernel maps on demand and so keeps the transpose at every stride. It also
+  changes the TS backbone's decoder blocks, which worked before. Both accepted deliberately;
+  the alternative was stateful conditional logic in the shim. The TorchSparse run therefore
+  **restarts clean** rather than resuming from its epoch-30 checkpoint.
+- Patch regenerated (9 files, reverses cleanly, applies to a pristine `5fe600a`),
+  `container_export/` synced, tarball repacked — **must be re-uploaded to R2.**
+- **Two discrepancies spotted in the failed run's log, still unresolved:**
+  `training=default` was used instead of `training=treeins_set1`, and it logged
+  `EPOCH 1 / 100` with 188 iterations — 188 implies `batch_size: 4` (our patched value) but
+  100 epochs implies the *unpatched* `epochs`, so the box's `conf/training/default.yaml`
+  matches neither. And `Model size = 11872109` for `PointGroup-PAPER-TS` against the
+  runbook's documented `11872126` for `PointGroup-PAPER`: a 17-parameter gap that should not
+  exist between two backends of the same model. Diff the box's tree against the patch, and
+  the two config blocks against each other, before the next long run.
+  **→ Model size resolved 2026-09-17: not config drift.** 17 is one output of the
+  `Linear(16→N)` semantic head, so `11872126` was the old 5-class model and `11872109` is
+  the correct 4-class size — both backbones log it. See the 2026-09-17 entry.
+
+---
+
+## 2026-09-01 — The backbone A/B has its answer, and a pool that was rebuilt 196× an epoch
+
+With both TorchSparse fixes in, the TS run cleared epoch 31 and kept going — so for the
+first time there are comparable timings on **identical** code (`_compute_score` is
+byte-identical between the two model files, and both hard-code `cluster_voxel_size = False`,
+so the sparse backend is the only variable):
+
+| phase | MinkowskiEngine | TorchSparse |
+|---|---|---|
+| epochs 1–30 (backbone + heads) | 1.04 s/it · 3:16/epoch | 1.26 s/it · 3:57/epoch |
+| epoch 31+ (scorer active) | 13.70 s/it · ~44 min/epoch | 27.8–29.6 s/it · ~1h32m/epoch |
+
+- **TorchSparse is slower here — 1.21× on the backbone, 2.1× with the scorer.** That is a
+  result, not a defect, and it closes the backbone question. The "TorchSparse is faster"
+  claim benchmarks against MinkowskiEngine **v0.4** on large, spatially coherent scenes;
+  this image has ME from git master (0.5.x), and the hot path is the opposite shape —
+  `_compute_score` hands `ScorerUnet` hundreds of small, spatially *disjoint* clusters at
+  full resolution, packed into a fresh `SparseTensor` (empty `cmaps`/`kmaps`) every
+  iteration. Fragmented coordinates are the worst case for hash-based kernel-map
+  construction, and the per-cluster GEMMs are too small to amortise launch overhead.
+  Not a build problem: `TORCH_CUDA_ARCH_LIST` includes `8.0`, so the A100 has native
+  kernels for both.
+- **Subtracting the pre-scorer baseline**, the scorer stage costs 12.66 s/it on Minkowski
+  and 26.57 s/it on TorchSparse. Mean-shift and `region_grow` are backend-independent, so
+  essentially all of that ~14 s/it delta is `ScorerUnet`.
+- **The cost common to both**: `cluster_single` built and tore down a whole
+  `multiprocessing.Pool` on *every* forward pass — ~196 lifecycles per epoch (188 train +
+  2 val + 6 test), each forking up to `batch_size` copies of an ~8 GB process holding a live
+  CUDA context, to do a few hundred ms of sklearn per child. Now one process-wide pool,
+  created lazily, released via `atexit`, with an explicit `fork` context (falling back where
+  fork does not exist, so importing the module off the training box stays harmless).
+- **Semantics unchanged, and checked rather than asserted.** `pool.map` is order-preserving
+  and `MeanShift(bandwidth, bin_seeding=True)` is deterministic. Verified standalone
+  (`sklearn` only — torch is not in the `aifor` env): 48 maps / 19,200 labels
+  byte-identical between fresh-pool-per-call and one shared pool.
+- `cluster_loop` got the same treatment for consistency, with a comment recording that it is
+  **dead code** — every `_cluster3`…`_cluster7` in both model files calls `cluster_single`.
+- Patch regenerated (9 → **10 files**, reverses cleanly, applies to a pristine `5fe600a`),
+  `container_export/` synced, tarball repacked — **must be re-uploaded to R2.**
+- **This does not speed up the run in flight.** Python had already imported the module; the
+  TorchSparse job was left alone to finish. The fix applies to the next run. Worth
+  re-checking once there is a measured number: continuing costs ~103 h, and a restart
+  carrying the fix might finish sooner.
+
+---
+
+## 2026-09-16 — Training done; local inference wired up for both backbones
+
+Both 99-epoch runs finished. The checkpoints live in `ForAINet/pre-trained_models/`
+(`PointGroup-PAPER.pt`, `PointGroup-PAPER-TS.pt`, 761 MB each) — inside the submodule, so
+the existing `./ForAINet:/workspace` mount exposes them to the debug container with no
+compose change. The folder stays **untracked** in the submodule so it can never enter the
+patch.
+
+- **Evaluation plots re-created.** The PLYs had been deleted. `convert.py
+  convert.plots=[plot_11_val,plot_01_test,plot_14_test]` with the config's *default*
+  paths (`ForAINet_export/` → `raw/SegmentedForests/`) — a pure format change, no
+  restore, coordinates stay centred. The `raw/` copy of `plot_11_val.laz` is byte-identical
+  to the export's (SHA-256), so this is the same conversion. Verified per plot: vertex count
+  equals `n_points` in `<plot>_offsets.yml`, the ForAINet field layout, and the body is
+  exactly `n_points × 37` bytes.
+- **`conf/eval.yaml` made runnable** (container paths — MinkowskiEngine and TorchSparse are
+  Linux-only, so a `D:\…` path cannot work): `checkpoint_dir: /workspace/pre-trained_models`,
+  `fold` = plot_01_test, plot_14_test, plot_11_val (outputs `Evaluation_0/1/2`), and a run
+  dir with `${model_name}` in it, since `Evaluation_*.txt` is opened in append mode. Composed
+  under the container's real Hydra 1.0.7: the list parses, and the run dir resolves
+  separately per model.
+- **What a checkpoint contains** (read straight from the pickle, stdlib only, no torch):
+  22 weight sets — `latest` plus 21 `best_<metric>` — with 99 epochs of train/val/test stats.
+  Every `best_*` was selected on **val** (`base_dataset.py:519-521`), i.e. on plot_11.
+
+  | training metrics (subsampled) | Minkowski latest | Minkowski best | TorchSparse latest | TorchSparse best |
+  |---|---|---|---|---|
+  | val mIoU | 65.09 | 69.08 (ep 66) | 64.99 | 68.29 (ep 22) |
+  | test mIoU | 70.03 | 70.42 (ep 78) | 69.71 | 70.41 (ep 92) |
+  | test F1 | 0.486 | 0.513 (ep 91) | 0.468 | 0.526 (ep 95) |
+
+- **Two traps documented** (`docs/eval_process.md` §9). A mistyped `weight_name` silently
+  loads `latest` (bare `except:` in `get_state_dict`). And TorchSparse's `best_miou` is from
+  **epoch 22, before `prepare_epoch: 30`** — its ScoreNet was untrained, so `latest` stays
+  the default.
+- **Myth corrected: `eval.py` needs no `_val`/`_eval` file.** The suffix matters only to
+  `train.py` (split at `segmentation/treeins_set1.py:381-386`, val evaluated every epoch,
+  `best_*` selected on it). With `fold` set to paths, every split goes through
+  `process_test()`.
+- Patch 10 → **11 files** (reverses cleanly, applies to a pristine `5fe600a`, identical
+  once CRLF is normalised), `container_export/` synced, tarball repacked.
+- `docs/learning.md` gained *Model selection & "best" checkpoints*. Its older "In this
+  project" links are still repo-root-relative from before the file moved to `docs/`, and
+  no longer resolve — not fixed here.
+
+---
+
+## 2026-09-17 — Both evaluations verified against the 4-class scheme; results recorded
+
+The question: does `eval.py` respect the 5 → 4 class change, and are the two evaluation runs
+correct? Yes to both — checked, not assumed.
+
+- **Where the class count lives.** Not in `train.py` — the patch only adds `import debugpy`
+  there. It lives in `datasets/{segmentation,panoptic}/treeins_set1.py` and `final_eval`,
+  which both entry points reach through the same `Trainer`. Eval cannot disagree with
+  training unless the patch is reverted, and then nothing crashes.
+- **Five checks** (now a reusable checklist, `docs/eval_process.md` §10):
+  1. `misc/check_forainet_classes.py --verbose` passes 16/16.
+  2. Both eval logs end the semantic head with `Linear(in_features=16, out_features=4)`,
+     and **both** backbones print `Model size = 11872109`.
+  3. Both load `…/<model>.pt:latest`.
+  4. `Semantic Segmentation IoU` has 5 slots, `[ignore, 4 classes]`, and the mIoU
+     recomputes over the 4 real ones. Minkowski plot_01:
+     (0.4914+0.8160+0.6621+0.8193)/4 = 0.6972, as reported.
+  5. One report block per `Evaluation_<i>.txt`.
+- **The 17-parameter "gap" was the fifth class.** 11872126 − 11872109 = 17 = one output of
+  `Linear(16→N)` (16 weights + 1 bias). The documented sanity value came from the July
+  5-class runs. The runbook, pre-flight and backbone docs now expect `11872109`. The
+  2026-09-01 suspicion of config drift was wrong, and the check script confirms the two
+  model blocks match.
+- **Uneven per-class IoU is class share, not swapped labels.** Heights above the lowest
+  point of each 1 m cell (plot_14 / plot_01 medians) match the class names: ground
+  0.05 / 0.22 m, low_vegetation 0.59 / 0.42 m, stem_points 5.4 / 2.3 m, live_branches
+  11.9 / 6.8 m. On plot_14, live_branches is 68.8% of the points (IoU 0.97) and ground
+  4.3% (IoU 0.65); on plot_01 ground is 22.9% and scores 0.82. New glossary entry:
+  *Class imbalance*.
+
+Full-resolution results (`weight_name: latest`, one `Evaluation_<i>.txt` per plot):
+
+| model | plot | oAcc | mIoU | low_veg | ground | stem | live_br | inst P | inst R | PQ things |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Minkowski | plot_01_test | 0.853 | 0.697 | 0.491 | 0.816 | 0.662 | 0.819 | 0.342 | 0.110 | 0.111 |
+| Minkowski | plot_14_test | 0.956 | 0.822 | 0.843 | 0.654 | 0.825 | 0.967 | 0.544 | 0.413 | 0.349 |
+| Minkowski | plot_11_val | 0.846 | 0.629 | 0.342 | 0.543 | 0.693 | 0.940 | 0.278 | 0.167 | 0.129 |
+| TorchSparse | plot_01_test | 0.848 | 0.689 | 0.471 | 0.814 | 0.653 | 0.819 | 0.261 | 0.050 | 0.059 |
+| TorchSparse | plot_14_test | 0.952 | 0.816 | 0.825 | 0.658 | 0.819 | 0.962 | 0.593 | 0.427 | 0.380 |
+| TorchSparse | plot_11_val | 0.847 | 0.631 | 0.339 | 0.554 | 0.694 | 0.937 | 0.389 | 0.233 | 0.165 |
+
+- **Semantics are solid on the test plots** (mIoU 0.69–0.82), and the two backbones are
+  within ~0.01 on every plot. There is no measurable quality difference between them, only
+  the training-speed difference recorded on 2026-09-01.
+- **Tree instances are the weak part:** recall 0.05–0.43 and PQ(things) 0.06–0.38, worst
+  on plot_01. The live tracker showed test F1 ≈ 0.47–0.48 over cylinders; the drop comes
+  with full-resolution block merging. With two test plots, report per plot, not averaged.
+- **Eval wall time is not a backbone comparison.** Minkowski took 1 h 52 min and
+  TorchSparse 34 min, but between the runs `to_eval_ply` (`panoptic/treeins_set1.py:83`)
+  was switched to `text=False`. The `_forEval` PLYs went from ASCII (1.32 GB for plot_01)
+  to binary (333 MB), and ASCII formatting through the Windows bind mount was most of the
+  first run. `to_ply` and `to_ins_ply` still write ASCII. **That edit is not in
+  `patches/forainet-local.patch` yet:** `git apply --check --reverse` still passes only
+  because line 83 lies outside every hunk's context, so the check cannot see it.
+- **→ Resolved the same day: all three writers are binary, and the patch carries them.**
+  - `to_ply` and `to_ins_ply` got `text=False` too, with one LOCAL PATCH comment covering all
+    three.
+  - Tested on the exact code: the three functions were extracted from the file with `ast`,
+    since Docker was down and the host has no torch. All three write binary little-endian;
+    xyz, labels, colours and the `-1` in `gt` round-trip identically; and every file opens
+    with KPConv's `read_ply`, which raised *"The file is not binary"* on the old ASCII.
+  - Nothing downstream is lost: `tree_metrics/`, `merge_tiles.py` and our restore read
+    through plyfile, which takes either format.
+  - **Correction (2026-09-18):** this entry originally also claimed the switch was what let
+    upstream's `evaluation_stats*.py` open these files, because they use KPConv's `read_ply`.
+    They **import** it and never call it — all 22 variants read through plyfile. The claim
+    was wrong and has been removed from the patch READMEs, `eval_process.md` and the
+    `LOCAL PATCH` comment. The switch stands on size and speed alone (1.32 GB → 333 MB per
+    plot; a full 3-plot eval 1 h 52 min → ~12 min).
+- **The patch-verification recipe had a blind spot, now closed.** The *old* patch was shown to
+  pass `git apply --check --reverse` while a tree rebuilt from it differed by 18 lines in
+  `panoptic/treeins_set1.py`. `patches/README.md` now calls the reverse check "necessary,
+  not sufficient" and adds the real test: rebuild a pristine `5fe600a` from the patch and
+  diff every file it touches (CRLF-normalised). The regenerated patch (11 files) passes
+  both, and the documented block was run verbatim.
+
+---
+
+## 2026-09-17 — Viewer: one colour per value (palettes, hex, picker), and a colour bug fixed
+
+**`misc/view_split_point_cloud.ipynb`** can now set the colour of every value of the
+current *Colour by* field. Tracing the request first turned up a bug that had to be
+fixed for the feature to mean anything.
+
+- **The bug.** `color_spec()` handed out palette colours by a value's **rank among the
+  values currently drawn**, so any change to the value set recoloured everything.
+  Measured on the notebook's own code, class 3 came out **light orange** over
+  `{0,1,2,3,4}`, **blue** after filtering to `{3,4}`, and **light blue** in a cloud
+  without classes 0 and 2. In a two-cloud comparison tool the same class could
+  therefore look different on each side.
+- **The fix, and the feature, are one mechanism.** A new `ColourScheme` (cell 3, tk-free)
+  holds `{field: {value: "#rrggbb"}}`. A value's colour is **pinned the first time it is
+  drawn** and then only the user moves it. `PointCloudCompareApp` creates **one** scheme
+  and gives it to both panels, so a value matches across Cloud A / Cloud B; every change
+  redraws both.
+- **`Colours…`** (new button, on the *Fields shown… / 3D view* row) lists each value in
+  view with a swatch, a hex box, **Pick…** (the OS colour chooser) and its point count,
+  plus a palette dropdown and *Apply palette*. `parse_colour` accepts `#E9E56B`, `#abc`,
+  `e9e56b` and matplotlib names (`red`, `tab:blue`) but **rejects bare numbers** —
+  matplotlib reads `"1"` as white and `"0.5"` as grey, never what a hex box means.
+- **Palettes**: tab20 (default, so first-draw colours are unchanged), tab10, Set1-3,
+  Paired, Dark2, Accent, Pastel1, plus **ForAINet classes** — the `OBJECT_COLOR` rows
+  from `panoptic/treeins_set1.py`, re-indexed to our on-disk `semantic_seg`
+  (0 unclassified black, 1 low_veg yellow, 2 ground blue, 3 stem brown, 4 branches
+  salmon).
+- **Save… / Load…** write one JSON per field (default `misc/conf/colours/<field>.json`).
+  Loading validates every entry and **reports** the bad ones instead of dropping them.
+- **The discrete rule is deliberately unchanged**: ≤ 20 distinct integers *in what is
+  drawn*. That is what keeps the documented `tree_ID` workflow working (filter to a few
+  ids → each tree gets its own colour → they appear as rows in `Colours…`). On a float
+  or wide field the button explains how to get there. `color_spec()` still serves both
+  the 2-D scatter and the 3-D export, so custom colours reach the 3-D window for free
+  and `misc/view_cloud_3d.py` needed **no change**. `color_spec(cvals)` without a scheme
+  still behaves exactly as before.
+- Also: `load_file()` split into the dialog plus `load_path(path)`, so a test can fill a
+  panel without clicking.
+- **Verified.** 31 headless checks on the real notebook cells: the three-colour bug
+  scenario now gives one colour; `parse_colour` accept/reject table; preset hexes exact;
+  `apply_palette` order-independent; JSON round-trip with int keys and malformed-file
+  reporting; legacy `color_spec` untouched. 12 GUI checks with a real tk window —
+  `plot_11_val.ply` (18.9 M pts, loaded in 1.5 s) in panel A and a synthetic cloud
+  *missing classes 0 and 2* in panel B: a custom magenta appears in **both** panels and
+  B's colours are a subset of A's; the ForAINet preset reaches the canvas; the editor
+  opens, and explains itself on a float field. 3-D: the payload carries the preset blue
+  and the custom magenta per point and in the legend, and
+  `view_cloud_3d.py --smoke` rendered it — the PNG shows ground blue at the bottom,
+  crowns salmon on top and the overridden stems magenta as vertical trunks.
+
+---
+
+## 2026-09-18 — The pooled report made 4-class-aware; the backbone comparison settled
+
+`evaluation_stats_FOR.py` pools every plot of an eval run into one set of numbers — the
+figure to quote as *the* result. It was **not** aware of the 5 → 4 class change, and could
+not run at all. Five separate problems, all now fixed and carried in the patch (12 files):
+
+| Problem | Was | Now |
+|---|---|---|
+| class constants | `NUM_CLASSES_sem 6`, `sem_classcount [1..5]`, `..._remove_ground [1,3,4,5]`, `thing_classes [3,4,5]` | `5`, `[1,2,3,4]`, `[1,3,4]`, `[3,4]` — same values `final_eval` already carries |
+| `np.float` ×2 | `AttributeError` on numpy ≥ 1.24 | `float` |
+| the hardcoded path | plain string, so `\04`→`\x04` and `\a`→BEL: glob matched 0 files and the script died later on an undefined variable | `r""` plus `<run_dir> [index …]` on the command line |
+| binary counters | re-zeroed **inside** the per-plot loop, so every "Binary Semantic Segmentation" figure and the stuff RQ/SQ/PQ described only the *last* plot | initialised once; pooled binary mIoU now lands between the per-plot values (0.9573 / 0.9633 → 0.9603) instead of equalling the last |
+| `positive_classes[[…]]` | doubled brackets → `(1,K)` array → `float()` raised `TypeError`; with >1 class this line could never run | single brackets |
+
+Also: the unused `torch_points3d` import is gone, so **the pooled report runs on the host**
+in `aifor` — no container, no GPU. `misc/check_forainet_classes.py` now guards its four
+class constants too (21 checks; negative-tested by reverting `thing_classes`, which it
+catches by name).
+
+**Pooled result over the two `_test` plots** (41,534,130 points; `weight_name: latest`):
+
+| | MinkowskiEngine | TorchSparse |
+|---|---|---|
+| oAcc | **0.9048** | 0.8996 |
+| mIoU | **0.7768** | 0.7662 |
+| mIoU without ground | **0.7734** | 0.7602 |
+| binary mIoU (tree / non-tree) | **0.9603** | 0.9484 |
+| mMUCov / mMWCov | **0.357 / 0.419** | 0.298 / 0.369 |
+| mPrecision / mRecall | **0.505 / 0.238** | 0.494 / 0.196 |
+| instance F1 | **0.324** | 0.280 |
+| meanSQ / meanPQ (things) | 0.732 / **0.237** | **0.755** / 0.212 |
+
+MinkowskiEngine is ahead on every figure except `SQ (things)` — when TorchSparse did match
+a tree it outlined it slightly better, but it found fewer.
+
+**Verified, not assumed.** An independent numpy recomputation of the pooled confusion matrix
+straight from the same PLYs reproduces the script's `oAcc`, `mIoU` and `mIoU without ground`
+to 13 decimals, over exactly 20,831,953 + 20,702,177 points. That is the check that would
+catch a class-index mistake.
+
+**Eval is deterministic — the earlier "run-to-run variance" was wrong.** Three runs per
+backbone produced **byte-identical** `Evaluation_<i>.txt` (zero spread on mIoU, oAcc,
+MUCov, precision, recall, F1, PQ). So the backbone differences above are real and not
+noise, and my earlier claim that sparse-conv atomics were moving the instance numbers was
+unfounded.
+
+**What did move them: whether the eval cache already existed.** The 2026-09-16 run that
+disagreed was the one that *built* `processed_0.2_test/`; every run since has loaded it.
+Tested by moving the cache aside and re-running — the result reproduced that first run to
+every printed digit:
+
+| | cache **built** by the run | cache **loaded** |
+|---|---|---|
+| plot_01 mIoU / recall | 0.6972 / 0.1102 | 0.6996 / 0.0932 |
+| plot_14 mIoU / recall | 0.8223 / 0.4133 | 0.8216 / 0.4667 |
+| plot_11 mIoU / recall | 0.6292 / 0.1667 | 0.6320 / 0.2000 |
+
+Two regimes, each perfectly reproducible, differing by up to 0.053 in instance recall. The
+mechanism inside `process_test` is **not** isolated — the operational rule is what matters:
+compare only runs in the same regime, and after deleting the cache (required whenever the
+raw PLYs change) re-run every model being compared. Every number in this entry is from
+cache-loading runs for both backbones, so the comparison is sound. Recorded in
+`eval_process.md` §11.
+
+Housekeeping: the five extra runs made for this test keep their `Evaluation_*.txt` and
+`eval.log`; their PLYs and checkpoint copies were deleted (eval/ 30.0 → 9.9 GB). The two
+runs the tables quote are untouched.
+
+**Correction carried out.** The claim that binary PLYs were needed for upstream's
+`evaluation_stats*.py` (KPConv `read_ply` rejecting ASCII) was wrong — those scripts import
+`read_ply` and never call it; all 22 read through plyfile. Removed from the patch READMEs,
+`eval_process.md` §7, the `LOCAL PATCH` comment and the 2026-09-17 entry. Binary still wins
+on size and speed (1.32 GB → 333 MB per plot; a 3-plot eval 1 h 52 min → ~12 min).
+
+---
+
+## 2026-09-21 — The report chapters, the comparison with the publication, and a cleanup
+
+The pipeline work is done; this entry closes the project out.
+
+- **Two report chapters** (`docs/report_methodology.md`, `docs/report_results.md`) written
+  for a reader rather than a maintainer — the opposite register to the rest of `docs/`.
+  Methodology covers the dataset and its four unification steps, the technology stack and
+  the container encapsulation, and the twelve-file patch grouped by purpose; Results covers
+  training, the backbone comparison, the comparison with the publication, and six themed
+  challenges. No new measurements: every figure is sourced from `evaluation_total.txt`,
+  this file, or the offsets sidecars, and a check asserts that each one rounds from a value
+  present in those sources.
+- **Compared against the paper's Table 4, basic setting** — the row our training arguments
+  correspond to. The metric *names* differ but the quantities are identical, and that was
+  verified rather than assumed: the paper's completeness 79.3 % with commission error
+  21.2 % implies precision 78.8 %, and those recombine to its own reported F-score of 79.0.
+  So *completeness* = recall, *commission error* = 1 − precision, *F-score* = F1.
+
+  | | paper (basic) | Minkowski | TorchSparse |
+  |---|---|---|---|
+  | semantic mIoU | 73.0 | **77.7** | 76.6 |
+  | semantic mAcc | 81.2 | **85.9** | 85.4 |
+  | instance F-score | **79.0** | 32.4 | 28.0 |
+  | coverage | **77.0** | 35.7 / 41.9 | 29.8 / 36.9 |
+
+  **Semantic segmentation transferred to terrestrial LiDAR; instance segmentation did not.**
+  Caveat on the semantic half: ours averages over 4 classes, theirs over 5.
+- **A caveat that had been missed entirely, and materially changes the reading.**
+  SegmentedForests carries semantic labels only — the source `.laz` dimensions are the
+  standard LAS set plus `Class` and `Split`, with **no tree id**. Every instance label in
+  this project comes from 3DFin (Stage 1), not from manual annotation, while the paper's
+  instance figures are measured against hand-delineated trees. So label provenance is a
+  second candidate explanation for the instance gap alongside the airborne-vs-terrestrial
+  sensor difference, and the two cannot be separated without a manually delineated subset.
+  Recorded in both chapters.
+- **`misc/make_backbone_comparison.py`** regenerates `docs/wandb_backbone_comparison.{md,html}`
+  from the two `evaluation_total.txt` files, so those tables are reproducible rather than
+  hand-maintained. Verified: a regeneration is byte-identical to the committed files.
+  **`misc/log_html_to_wandb.py`** uploads an HTML file as a W&B media panel — the only way
+  to get styled tables into a report, since W&B's markdown blocks strip raw HTML.
+- **Cleanup for the final commit.** Deleted the repo-root `Dockerfile` and `.dockerignore`
+  (a VSCode `python:3-slim` template with no CUDA that `gpu_training_runbook.md` already
+  warned against — the warning is rewritten, not just orphaned), `docs/errors/` (raw
+  epoch-31 crash logs, all three narrated above), and `misc/view_pointcloud.ipynb`
+  (superseded, referenced nowhere). **`.gitattributes` is finally tracked**: it is the fix
+  for `core.autocrlf=true` shipping CRLF `preflight.sh` into the container, where bash dies
+  on the first line. `docs/training_forainet.pdf` is ignored by name rather than by `*.pdf`,
+  which would have swallowed the report itself.
+
 ---
 
 ## Planned

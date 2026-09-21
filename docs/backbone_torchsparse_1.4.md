@@ -378,7 +378,7 @@ Do **not** judge by "it ran". Compare against the baseline already captured in
 | Check | Baseline (Minkowski) | What to expect |
 |---|---|---|
 | Module tree | `MinkowskiConvolution(in=4, out=16, ...)` | should now print torchsparse `Conv3d` modules, same channel widths `4→16→32→48→64→80→96→112` |
-| `Model size` | `11872126` | **should match closely**. A large difference means the architecture changed, not just the kernels |
+| `Model size` | `11872126` in that July log, which **predates the 4-class patch** | **`11872109`** — the 4-class head, 17 parameters (one `Linear(16→N)` output) fewer. Both backends log exactly this; any other difference means the architecture changed, not just the kernels |
 | Deprecation warning | present 3× | **gone** — you are off the legacy API |
 | `train_acc` after 1 epoch | ~75 | same ballpark |
 | `val_miou` after 2 epochs | ~53 | same ballpark |

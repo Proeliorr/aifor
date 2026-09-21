@@ -52,6 +52,7 @@ The development history — what was added when and why — is tracked in
 | [`misc/`](misc/README.md) | **Standalone tools outside the pipeline.** `misc/tree_splitter.py` (per-tree `.npy` splitting, own `misc/conf/config.yaml`) and `misc/Points2ForAINet.py` (the original generic converter Stage 2 was ported from). |
 | [`requirements.txt`](requirements.txt) | Pinned Python deps (`hydra-zen`, `hydra-core`, `omegaconf`, `laspy`, `lazrs`, `plyfile`, `PyYAML`), all already satisfied by the `aifor` env. **3DFin itself is an external CLI, not a pip dependency of this package.** |
 | [`docs/progress.md`](docs/progress.md) | **Development history** — what functionality was added when, and what is planned. |
+| [`docs/report_methodology.md`](docs/report_methodology.md) · [`docs/report_results.md`](docs/report_results.md) | **The write-up**, for a reader rather than a maintainer: materials, technologies and the changes made to ForAINet; then the training, the backbone comparison, the comparison with the publication, and the biggest challenges. Start here if you want the project rather than the code. |
 | [`.gitignore`](.gitignore) | Excludes the large binary data (input clouds, Stage 1 outputs, Stage 2 clouds) from version control; the small `<plot>_offsets.yml` metadata files stay tracked. |
 
 ### Two 3DFin 0.6.0 quirks the runner works around

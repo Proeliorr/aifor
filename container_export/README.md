@@ -72,8 +72,11 @@ docker run --rm for-ai-net ls /workspace/PointCloudSegmentation/train.py
 
 - **Found** → this export is complete; build and push.
 - **Not found** → the image has no training code (locally it came from the
-  `./ForAINet:/workspace` bind mount, which does not exist on a rented host). Add to
-  `Dockerfile.train`:
+  `./ForAINet:/workspace` bind mount, which does not exist on a rented host). Either let
+  `preflight.sh` clone it at the pinned `5fe600a` on the instance (the normal route now — see
+  [`docs/preflight_cheap_gpu.md` §2b](../docs/preflight_cheap_gpu.md#2b-what-the-script-repairs-by-itself);
+  note the tree then lives at `/workspace/ForAINet/`, one level deeper), or bake it in by
+  adding to `Dockerfile.train`:
 
   ```dockerfile
   COPY ForAINet/ /workspace/

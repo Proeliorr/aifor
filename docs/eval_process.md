@@ -197,7 +197,10 @@ are a thing class in either the prediction or the ground truth.
 
 ## 7. What lands on disk
 
-Hydra run directory: `${checkpoint_dir}/eval/${now:%Y-%m-%d_%H-%M-%S}`. Per test file `i`:
+Hydra run directory: `${checkpoint_dir}/eval/${model_name}/${now:%Y-%m-%d_%H-%M-%S}` —
+`${model_name}` is our addition, so the two backbones never write into one folder. On this
+machine that is `ForAINet/pre-trained_models/eval/<model_name>/<timestamp>/`. Per test file
+`i`, where `i` is the file's **position in `data.fold`**:
 
 | File | Contents |
 |---|---|
@@ -206,33 +209,86 @@ Hydra run directory: `${checkpoint_dir}/eval/${now:%Y-%m-%d_%H-%M-%S}`. Per test
 | `Instance_Results_forEval_<i>.ply` | predicted instance ids, full resolution |
 | `Instance_results_withColor_<i>.ply` | the same, random colour per instance — for looking at |
 | `Instance_subsample_<i>.ply` | instance ids at subsampled resolution |
-| `vote1regular_<i>.ply` | per-file voting output (`tracker_options.ply_output`) |
+| `vote1regular.ply_<i>.ply` | per-file voting output — the tracker appends `_<i>.ply` to the *whole* `tracker_options.ply_output`, hence the doubled extension |
 | `vote1regularfull.ply`, `Instance_Offset_results_forEval.ply` | run-level, **not** per-file, so they are overwritten each file |
+| `<model_name>.pt` | a **copy of the checkpoint** (761 MB) — `Checkpoint.load` copies it into every run directory when `checkpoint_dir` is set. Safe to delete afterwards |
 
 The `_withColor` file is the one to open in a viewer; the others carry raw ids.
 
+**Every PLY is binary little-endian** (our patch; upstream wrote ASCII). The format decides
+how long eval takes. For plot_01 (20.8 M points), `Semantic_results_forEval_0.ply` is
+333 MB binary against 1.32 GB as text. The first local eval, all ASCII, took **1 h 52 min**,
+mostly formatting floats through the Windows bind mount; with the `_forEval` writers binary,
+the next took 34 min. Nothing downstream minds: `tree_metrics/`, `merge_tiles.py`, the
+standalone `evaluation_stats*.py` and `forainet_prep.py forainet_prep.mode=restore` all
+read through plyfile, which takes either format. (The `evaluation_stats*.py` scripts do
+import KPConv's `read_ply`, which rejects ASCII — but they never call it.)
+
 ## 8. Running it on SegmentedForests
 
-`conf/eval.yaml` ships pointed at the original author's machine and **cannot run as-is**.
-Three keys must change:
+Upstream's `conf/eval.yaml` pointed at the original author's machine and could not run.
+[`patches/forainet-local.patch`](../patches/README.md) now carries a working one for the
+**local Docker container** (`docker-compose.yml` mounts `./ForAINet` at `/workspace`):
 
-| Key | Ships as | Needs to be |
+| Key | Upstream shipped | Ours |
 |---|---|---|
-| `checkpoint_dir` | empty | the training run's output directory (the one holding `PointGroup-PAPER.pt`) |
-| `data.fold` | eleven absolute paths under `/cluster/work/igp_psr/binbin/…` | absolute paths to **your** test PLYs |
-| `weight_name` | `"latest"` | `"latest"` for the final epoch, or a metric name (`miou`, `macc`) for the best checkpoint under it |
+| `checkpoint_dir` | empty | `/workspace/pre-trained_models` — the host's `ForAINet/pre-trained_models/`, holding **both** trained models |
+| `model_name` | `PointGroup-PAPER` | unchanged; `PointGroup-PAPER-TS` on the command line for TorchSparse |
+| `weight_name` | `"latest"` | unchanged — see §9 before changing it |
+| `data.fold` | eleven paths under `/cluster/work/igp_psr/binbin/…` | three **container** paths, below |
 
-For our split that means the two plots Stage 2 marked `_test`:
+**Every path is as the container sees it.** MinkowskiEngine and TorchSparse are Linux-only,
+so `eval.py` never runs on Windows, and a `D:\…` path in this file cannot work.
+
+**One directory, two models.** `Checkpoint.load` resolves `<checkpoint_dir>/<model_name>.pt`,
+and the files are named exactly after their model blocks. Keep `pre-trained_models/`
+**untracked** in the submodule — never `git add -N` it — so the 1.5 GB cannot enter the patch.
+
+**What a `.pt` contains.** 22 complete weight sets: `latest` (epoch 99) and 21
+`best_<metric>` snapshots. `weight_name` picks one — `miou` loads `best_miou`.
 
 ```yaml
 data:
-  fold: ['<abs>/treeinsfused/raw/SegmentedForests/plot_01_test.ply',
-         '<abs>/treeinsfused/raw/SegmentedForests/plot_14_test.ply']
+  fold: ['/workspace/PointCloudSegmentation/data_set1_5classes/treeinsfused/raw/SegmentedForests/plot_01_test.ply',   # -> Evaluation_0
+         '/workspace/PointCloudSegmentation/data_set1_5classes/treeinsfused/raw/SegmentedForests/plot_14_test.ply',   # -> Evaluation_1
+         '/workspace/PointCloudSegmentation/data_set1_5classes/treeinsfused/raw/SegmentedForests/plot_11_val.ply']    # -> Evaluation_2
 ```
 
-The `_test` suffix is not decoration — ForAINet reads the split from the file name
-(`name[-8:-4] == "test"`), so a renamed file changes which set it belongs to. See the
-README's *Train / val / test* section.
+The PLYs come from the LAZ export — a pure format change, so the coordinates stay centred
+exactly as the model trained on them:
+
+```powershell
+cmd /c "mamba run -n aifor python convert.py convert.plots=[plot_11_val,plot_01_test,plot_14_test]"
+```
+
+Then, inside the container, **from `/workspace/PointCloudSegmentation`** — `dataroot` is
+resolved against the launch directory (`hydra.utils.to_absolute_path` in
+`dataset_factory.py`), so starting anywhere else puts the cache in the wrong place:
+
+```bash
+python eval.py                                   # MinkowskiEngine
+python eval.py model_name=PointGroup-PAPER-TS    # TorchSparse
+```
+
+**The `_val` / `_test` suffix means nothing to `eval.py`.** It matters only to `train.py`,
+which splits `raw/**/*.ply` by name (`segmentation/treeins_set1.py:381-386`), evaluates the
+`_val` set every epoch (`trainer.py:164-165`) and picks the `best_*` checkpoints on it
+(`base_dataset.py:519-521`). Once `fold` holds paths, every split goes through
+`process_test()` instead, and `eval(stage_name="test")` skips the val stage
+(`trainer.py:179-181`). So any labelled PLY works, whatever it is called.
+
+Why all three plots: the two `_test` plots never influenced any weights, so they are the
+numbers to **report**. `plot_11_val` is still worth running — with `latest`, nothing picked
+those weights on it either — but it is the plot training watched.
+
+**On a 6 GB GPU**, `full_res: True` moves whole plots onto the device (`tracker.track`,
+`self._test_area[i].to(model.device)`). Windows desktop apps already hold ~1.5 GB of it. If
+eval runs out of memory, close GPU-heavy apps or evaluate one plot per run — its report is
+then `Evaluation_0.txt`:
+
+```bash
+python eval.py "data.fold=['/workspace/PointCloudSegmentation/data_set1_5classes/treeinsfused/raw/SegmentedForests/plot_11_val.ply']"
+```
 
 Afterwards, put the predictions back into real-world coordinates:
 
@@ -249,6 +305,19 @@ and CRS re-applied.
 
 - **`weight_name: "latest"` evaluates the last epoch, not the best one.** If the run
   overfit after its best epoch, this quietly reports the worse model.
+- **…but every `best_*` was picked on `plot_11_val`**, so a `best_*` snapshot evaluated on
+  plot_11 itself is optimistic. It is fair only on the `_test` plots.
+- **A mistyped `weight_name` does not fail.** `Checkpoint.get_state_dict`
+  (`model_checkpoint.py:136-145`) wraps the `best_<name>` lookup in a bare `except:` and
+  silently loads `latest`. Read the log line `Model loaded from …:<key>` to see what you
+  actually got.
+- **Never `weight_name: miou` for TorchSparse.** Its `best_miou` is from **epoch 22** —
+  before `prepare_epoch: 30`, so that snapshot's ScoreNet was never trained and its instance
+  results are meaningless. (Minkowski's `best_miou` is epoch 66, which is fine.)
+- **The per-plot eval cache is reused by file name.** `process_test` skips any plot whose
+  `processed_0.2_test/processed_<stem>.pt` already exists. Re-convert a PLY under the same
+  name and eval silently uses the old tensors — delete `processed_0.2_test/` first. (The
+  combined `processed_test.pt` is rewritten every run, so changing `fold` alone is safe.)
 - **`conf/config.yaml` defaults to `models: panoptic/area4_ablation_2` — a file that does
   not exist.** Confirmed: `conf/models/panoptic/area4_ablation_2.yaml` is absent. You must
   override `models=` (the real one is `panoptic/FORpartseg_3heads`) or Hydra fails at
@@ -263,6 +332,98 @@ and CRS re-applied.
 - **The 14 standalone `evaluation_stats_FOR*.py` scripts are not part of this path.**
   Several are named `set15classes` and still assume **five** classes. They were not
   touched by our patch; do not mix their output with `Evaluation_<i>.txt`.
+
+## 10. Is an evaluation run correct? — five checks
+
+The class count is not in `train.py` or `eval.py`. It lives in the dataset modules and in
+`final_eval`, which both entry points load through the same `Trainer`, so eval cannot
+disagree with training — **unless the patch was reverted**, and then nothing crashes. Check,
+in about a minute:
+
+1. **Tables agree with our config:** `python misc/check_forainet_classes.py` → `OK: … (4 classes, things=[3, 4])`.
+2. **The model really is 4-class.** The eval log's module tree ends the `Semantic` head with
+   `Linear(in_features=16, out_features=4)`, and it prints **`Model size = 11872109`**.
+   `11872126` is exactly 17 more — one extra output of that head (16 weights + 1 bias) — and
+   means a 5-class model.
+3. **The weights you meant:** `Model loaded from …/<model_name>.pt:<key>`. A mistyped
+   `weight_name` silently falls back to `latest` (§9).
+4. **The mean excludes the ignore slot.** `Semantic Segmentation IoU` has **five** entries,
+   `[ignore, low_vegetation, ground, stem_points, live_branches]`. `mIoU` must equal the
+   mean of the last four, not all five. Recompute it once by hand.
+5. **One report per file.** Each `Evaluation_<i>.txt` holds a single block starting with
+   `Semantic Segmentation oAcc:` (don't count `Binary Semantic Segmentation oAcc:`, which
+   also matches that text).
+
+**Uneven per-class IoU is not by itself a bug.** On plot_14, `live_branches` scores 0.97
+and `ground` 0.65. That's because live_branches is 68.8% of the points and ground only 4.3%,
+a thin sheet at the height of low vegetation. To rule out swapped labels, check heights: in
+the PLYs, `ground` sits a median 0.05–0.22 m above the lowest point of its 1 m cell, and
+`live_branches` 6.8–11.9 m. The results of the first two runs are recorded in
+[`progress.md`](progress.md) (2026-09-17).
+
+## 11. The pooled report across plots — `evaluation_stats_FOR.py`
+
+`Evaluation_<i>.txt` is **per plot**. `evaluation_stats_FOR.py` pools several plots into one
+set of numbers: one confusion matrix over all their points, and one instance matching over
+all their trees. That is the figure to quote as *the* result, and the one to compare
+backbones with.
+
+It needed the same 5 → 4 class fix as `final_eval`, plus four repairs before it could run at
+all — see [`patches/README.md`](../patches/README.md). `misc/check_forainet_classes.py` now
+guards its constants too, so a reverted patch is caught there.
+
+**It runs on the host**, not in the container: its only `torch_points3d` import was unused
+and is gone.
+
+```powershell
+cd ForAINet\PointCloudSegmentation
+cmd /c "mamba run -n aifor python evaluation_stats_FOR.py <eval_run_dir> 0 1"
+```
+
+- The trailing numbers are **positions in `eval.yaml`'s `data.fold`**. `0 1` pools the two
+  `_test` plots and leaves out `plot_11_val`, which training selected checkpoints on — that
+  is the defensible headline. Pass no numbers to pool every plot in the folder.
+- Output goes to `evaluation_total.txt` **inside the run folder, in append mode**, so
+  re-running stacks blocks. Each block is headed with the timestamp, the run directory, the
+  indices pooled and the fold filename behind each index, read from the run's own
+  `.hydra/config.yaml` — so a stacked file stays readable.
+- Expect it to take several minutes per plot: the instance part is an O(predicted × truth)
+  IoU over full-resolution masks.
+
+**Read the pooled numbers as pooled.** `oAcc` and `mIoU` weight every *point* equally, so a
+larger plot pulls them; `Evaluation_<i>.txt` remains the way to see a plot that behaves
+differently. The pooled mIoU must land between the per-plot values — a quick sanity check.
+
+### Eval is deterministic — but it has two regimes
+
+Repeating a run reproduces it **exactly**: three runs per backbone gave byte-identical
+`Evaluation_<i>.txt`, every metric, both backbones. So a difference between two models is
+real and not noise.
+
+**What does change the numbers is whether `processed_0.2_test/` already existed.** The run
+that *builds* that cache and the runs that *load* it give two different, each perfectly
+reproducible, sets of numbers — measured on the same checkpoint:
+
+| plot_01_test | cache built by the run | cache loaded |
+|---|---|---|
+| mIoU | 0.6972 | 0.6996 |
+| instance recall | 0.1102 | 0.0932 |
+
+| plot_14_test | cache built by the run | cache loaded |
+|---|---|---|
+| mIoU | 0.8223 | 0.8216 |
+| instance recall | 0.4133 | 0.4667 |
+
+Confirmed by moving the cache aside and re-running: the result reproduced the very first
+eval (2026-09-16) to every printed digit. The mechanism inside `process_test` has not been
+isolated — what matters operationally is the rule:
+
+> **Compare only runs in the same regime.** Build the cache once, then compare
+> cache-loading runs. If you delete `processed_0.2_test/` (which you must do whenever the
+> raw PLYs change), re-run *every* model you intend to compare.
+
+The numbers quoted here and in [`progress.md`](progress.md) are all cache-loading runs for
+both backbones, so they are directly comparable.
 
 ---
 

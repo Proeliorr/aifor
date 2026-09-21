@@ -10,14 +10,19 @@ instead: versioned in **our** repo, never pushed upstream.
 
 ## `forainet-local.patch`
 
-Adapts upstream to this project. **Seven files**, of which three carry the class-scheme
+Adapts upstream to this project. **Twelve files**, of which three carry the class-scheme
 change and are the ones that matter:
 
 | File | Why |
 |---|---|
+| `conf/eval.yaml` | **Local inference.** Upstream ships an empty `checkpoint_dir` and eleven test paths on the author's cluster, so it cannot run. Now: `checkpoint_dir: /workspace/pre-trained_models` (a *container* path — `./ForAINet` is mounted at `/workspace`, and both `.pt` files live in `ForAINet/pre-trained_models/`, untracked on purpose), `fold` = plot_01_test, plot_14_test, plot_11_val, and a run dir that includes `${model_name}` so the two backbones' append-mode reports never share a folder. See [`docs/eval_process.md`](../docs/eval_process.md) §8 |
+| `torch_points3d/utils/meanshift_cluster.py` | **Performance, both backends.** Upstream builds and destroys a `multiprocessing.Pool` inside `cluster_single` on *every* forward pass — ~196 pool lifecycles per epoch once `prepare_epoch: 30` opens the instance branch, each forking up to `batch_size` copies of an ~8 GB process holding a live CUDA context. Replaced with one process-wide pool. Results are unchanged: `pool.map` is order-preserving and `MeanShift(bandwidth, bin_seeding=True)` is deterministic |
 | `torch_points3d/models/panoptic/PointGroup3heads_ts.py` | **new file** — the same model on the TorchSparse 1.4 backbone, selected by `model_name=PointGroup-PAPER-TS`. MinkowskiEngine stays the default; see [`docs/backbone_torchsparse_1.4.md`](../docs/backbone_torchsparse_1.4.md) |
+| `torch_points3d/modules/SparseConv3d/nn/torchsparse.py` | **TorchSparse only — two fixes for one root cause.** `ScorerUnet`'s encoder starts at stride 2, so nothing in it ever operates at the input resolution, and TorchSparse 1.4 only records what a conv *produces*. Its decoder then needs two things that were never built: the **coordinate** map (`cmaps[(1,1,1)]`, seeded in `SparseTensor()`) and the **kernel** map (`kmaps[((1,1,1),(3,3,3),(1,1,1),(1,1,1))]`, avoided by running stride-1 "transposed" convs forward — at stride 1 the two differ only by a flip of a learned kernel). Without them: `KeyError: (1, 1, 1)` then `KeyError: ((1, 1, 1), (3, 3, 3), (1, 1, 1), (1, 1, 1))`. The backbone escapes both because its stride-1 stem builds them. **Invisible until epoch 31**, when `prepare_epoch: 30` runs the scorer for the first time |
+| `evaluation_stats_FOR.py` | **The pooled report across plots** — the "final" number, and it was five-class too (`NUM_CLASSES_sem`, `sem_classcount`, `sem_classcount_remove_ground`, `thing_classes`). Also fixed: `np.float` (numpy ≥ 1.24), a non-raw Windows path that silently matched no files, binary counters that were re-zeroed per plot so every "Binary Semantic Segmentation" figure described only the last plot, and `positive_classes[[…]]` whose doubled brackets made `float()` raise. Now takes `<run_dir> [index …]` on the command line and, with the unused `torch_points3d` import dropped, runs on the host in `aifor` |
+| `torch_points3d/metrics/panoptic_tracker_pointgroup_treeins_partseg.py` | `np.float` → `float`. NumPy 1.24 (what the training image ships) removed the alias, so `_compute_eval` raises `AttributeError`. Also invisible until epoch 31 — the instance metrics only run once clustering starts |
 | `torch_points3d/datasets/segmentation/treeins_set1.py` | **5 → 4 classes.** `Treeins_NUM_CLASSES`, `INV_OBJECT_LABEL`, `OBJECT_COLOR` — upstream's class 4 `branches` has no SegmentedForests counterpart, so nothing can ever map to it |
-| `torch_points3d/datasets/panoptic/treeins_set1.py` | the same table again (it is declared twice), plus `VALID_CLASS_IDS`, `SemIDforInstance`, and the `final_eval` counters `NUM_CLASSES_sem`, `NUM_CLASSES_count`, `sem_classcount`, `thing_classes` |
+| `torch_points3d/datasets/panoptic/treeins_set1.py` | the same table again (it is declared twice), plus `VALID_CLASS_IDS`, `SemIDforInstance`, and the `final_eval` counters `NUM_CLASSES_sem`, `NUM_CLASSES_count`, `sem_classcount`, `thing_classes`. Also: its three eval PLY writers (`to_ply`, `to_eval_ply`, `to_ins_ply`) emit **binary** instead of ASCII. ASCII was ~4× larger (1.32 GB vs 333 MB for one plot) and dominated a 1 h 52 min eval (the same eval takes ~12 min binary). Nothing downstream minds: `tree_metrics/`, `merge_tiles.py`, `evaluation_stats*.py` and our restore step all read via plyfile, which takes either format |
 | `conf/models/panoptic/FORpartseg_3heads.yaml` | `path_pretrained: null` (upstream points it at a **5-class** checkpoint on the author's cluster, see below), plus the `PointGroup-PAPER-TS` block that selects the TorchSparse model file |
 | `conf/training/treeins_set1.yaml` | our `wandb` entity + experiment name (upstream ships the author's `binbin`) |
 | `conf/training/default.yaml` | short debug runs (`epochs: 5`, `num_workers: 0`, `batch_size: 4`), our `wandb` entity/project, tensorboard off |
@@ -72,12 +77,34 @@ git diff -- . ':(exclude)*.pyc' > ../patches/forainet-local.patch
 The `.pyc` exclusion is essential: upstream commits bytecode (see below), so a bare
 `git diff` sweeps ~115 recompiled `.pyc` files into the patch.
 
-Verify the result **without touching the working tree** — if the patch reverses cleanly,
-it is an exact description of what you have:
+Verify the result **without touching the working tree**, in two steps:
 
 ```bash
-git apply --check --reverse ../patches/forainet-local.patch   # exit 0 = faithful
+git apply --check --reverse ../patches/forainet-local.patch   # necessary, NOT sufficient
 ```
+
+**Exit 0 there does not prove the patch is complete.** A reverse check only needs each
+hunk's *context* to match, so an edit lying outside every hunk passes unseen. This
+happened: `to_eval_ply`'s switch to `text=False` sat between two existing hunks of
+`panoptic/treeins_set1.py` and was missing from the patch for a whole session, while this
+check kept returning 0. The real test rebuilds a pristine tree from the patch and compares
+every file the patch touches:
+
+```bash
+P="$(pwd)/../patches/forainet-local.patch"
+T=/d/temp/forainet-verify                    # scratch on D:, not the C: temp
+rm -rf "$T" && mkdir -p "$T"
+git archive 5fe600a | tar -x -C "$T"
+(cd "$T" && git apply "$P") || echo "DOES NOT APPLY to a pristine 5fe600a"
+for f in $(grep '^diff --git' "$P" | sed 's|.* b/||'); do
+  # tr: this checkout has core.autocrlf=true, the pristine tree is LF
+  diff -q <(tr -d '\r' < "$T/$f") <(tr -d '\r' < "$f") >/dev/null || echo "NOT IN PATCH: $f"
+done
+rm -rf "$T"                                  # silence = the patch reproduces your tree
+```
+
+`git apply` prints ~35 *trailing whitespace* warnings on the way. They are expected: they
+come from `PointGroup3heads_ts.py`, which carries upstream's own formatting unchanged.
 
 (Do not try to verify by stashing: `git stash` refuses to move intent-to-add entries, so
 the tree does not actually become pristine and the test silently proves nothing.)

@@ -42,6 +42,13 @@ __pycache__/
 *.pyc
 .ipynb_checkpoints/
 
+# Editor / assistant state. Machine-specific and personal to whoever is working
+# here: VSCode launch+task configs, and the Claude Code session files. They were
+# tracked until 2026-09-22 and are untracked from that commit on -- earlier
+# commits still contain them, which is harmless (neither holds any credential).
+.vscode/
+.claude/
+
 # Offset file the misc converter writes next to itself
 misc/offset.yml
 

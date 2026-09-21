@@ -32,6 +32,11 @@ SegmentedForests/**
 # Per-run Hydra logs
 outputs/
 
+# W&B chart export: a snapshot of the training run's dashboard. Kept on disk,
+# not versioned -- 3.5 MB, and nothing in the repo reads it. Deliberately NOT
+# `*.pdf`, which would also swallow docs/Final_Report.pdf.
+docs/training_forainet.pdf
+
 # Python / Jupyter cruft
 __pycache__/
 *.pyc

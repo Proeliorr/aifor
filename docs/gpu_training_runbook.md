@@ -114,7 +114,9 @@ no counterpart to upstream's `branches` class. That change, and three others, li
 |---|---|
 | **5 -> 4 semantic classes** | class tables, `VALID_CLASS_IDS`, `SemIDforInstance` and the `final_eval` counters. Without it the model trains a head for a class no label can ever reach |
 | **Adds `PointGroup3heads_ts.py` + the `PointGroup-PAPER-TS` block** | this is what makes `model_name=PointGroup-PAPER-TS` (the TorchSparse run) exist at all |
+| **Two `SparseConv3d/nn/torchsparse.py` fixes** | without them the TorchSparse run dies at **epoch 31**, first with `KeyError: (1, 1, 1)` and then `KeyError: ((1,1,1),(3,3,3),(1,1,1),(1,1,1))`. `ScorerUnet` starts on a stride-2 conv, so TorchSparse never records the coordinate *or* kernel map its last decoder stage needs. MinkowskiEngine is unaffected |
 | **`path_pretrained: null`** | upstream points it at a *5-class* checkpoint on the author's cluster |
+| **One shared mean-shift pool** | upstream rebuilds a `multiprocessing.Pool` on every forward pass (~196 per epoch once clustering starts). Pure overhead, and it hits **both** backends. Results unchanged |
 | **wandb entity** | `binbin` -> `aifor` |
 
 `ForAINet/` is a **git submodule**, and a submodule stores only a commit SHA — so
@@ -259,7 +261,7 @@ python train.py task=panoptic data=panoptic/treeins_set1 models=panoptic/FORpart
 
 | Check | Expected | If it differs |
 |---|---|---|
-| `Model size` | `11872126` | a very different number means the architecture changed, not just the kernels |
+| `Model size` | `11872109` | a very different number means the architecture changed, not just the kernels. **`11872126` (exactly 17 more) is the old 5-class head** — one extra output of `Linear(16→N)` — so the 4-class patch is not applied |
 | `iou_per_class` | **four** entries `{0,1,2,3}` | **five** means the 4-class patch is not applied — run `python misc\check_forainet_classes.py` |
 | Minkowski deprecation warning | 3× on run 1, **absent** on run 2 | if present on run 2, TorchSparse is not actually being used |
 | All instance metrics | `0.0` | **correct** — clustering only starts after epoch 30 (`prepare_epoch`) |
@@ -332,10 +334,9 @@ are unchanged, only the new ~640 MB uploads.
 If the build fails at the smoke-test step, that is the point of it: it means the container
 could not read a `.laz` file, and it told you now instead of on a machine costing $1.50/hour.
 
-> **The `Dockerfile` in the repository root is not this file and cannot be used.** It is a
-> leftover VSCode template — `FROM python:3-slim`, no CUDA, no PyTorch, and a `CMD` written
-> with a Windows backslash that Linux cannot run. Building it produces an image that cannot
-> train anything. Always use `container_export/Dockerfile.train`.
+> **`container_export/Dockerfile.train` is the only Dockerfile in this repository, and the
+> one to build.** (A leftover VSCode template used to sit in the repository root; it was
+> removed, because building it produced an image that could not train anything.)
 
 ### B4. Also copy ForAINet in, if the image lacks it
 
@@ -348,6 +349,12 @@ COPY ForAINet/ /workspace/
 and copy `ForAINet\` (excluding `outputs\` and `data_set1_5classes\`) into
 `container_export\` first. That is ~6.3 MB of code — the 627 MB `outputs\` folder and the
 data must stay out.
+
+> **Path C — don't bake it in at all.** `container_export/preflight.sh` clones ForAINet at the
+> pinned commit `5fe600a` when the box has no `train.py`, then applies the patch: ~16 MB and a
+> few seconds, no image rebuild, no 15 GB push. That is now the normal route for a rented
+> instance — see [`preflight_cheap_gpu.md` §2b](preflight_cheap_gpu.md#2b-what-the-script-repairs-by-itself).
+> Baking it in is still worth it if you would rather not depend on GitHub at run time.
 
 ---
 
@@ -554,6 +561,14 @@ cd /workspace && git apply /opt/prep/patches/forainet-local.patch
 (That needs Path B's archive, or the patch copied in some other way. It is much easier to
 rebuild the image from a patched tree than to repair it here.)
 
+> **If there is no `/workspace/PointCloudSegmentation` at all**, the image is environment-only
+> — the code used to arrive through the `./ForAINet:/workspace` bind mount, which a rented host
+> does not have. Don't rebuild the image from here: run `PREFLIGHT_SKIP_TRAIN=1 bash preflight.sh`,
+> which clones ForAINet at `5fe600a`, applies this patch, verifies the 4 classes, converts the
+> data and clears the cache. It prints the resolved paths at the end — after a clone the
+> training root is `/workspace/ForAINet/PointCloudSegmentation`, one level deeper than
+> everything below assumes, so substitute it in E4–E7.
+
 ### E4. Turn the `.laz` back into `.ply`
 
 ```bash
@@ -644,8 +659,8 @@ tail -f outputs/segforest_mink/*/train.log
 
 Or in the wandb dashboard, where both runs appear side by side.
 
-Sanity checks in the first few minutes: `Model size = 11872126`, and `iou_per_class` with
-**four** entries. All instance metrics stay `0.0` until **epoch 31** — clustering is gated
+Sanity checks in the first few minutes: `Model size = 11872109` (not `11872126` — that is the
+5-class head), and `iou_per_class` with **four** entries. All instance metrics stay `0.0` until **epoch 31** — clustering is gated
 behind `prepare_epoch: 30`. That is correct behaviour, not a failure.
 
 ---
